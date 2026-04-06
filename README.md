@@ -17,13 +17,15 @@ Make sure `Anasys_Processing.py` is in the same folder as `snom_utils.py`.
 - **Generate a Template Configuration File** \
   Each measurement file or collection of files should have its own config.json file. This ensures that the data processing is reproducible and saved, and prevents having to reconfigure ref. files, fitting parameters etc. every time one wishes to process an array spectrum or related point spectra. To create a blank configuration file with default settings in your current directory:
 
-  _python3 Anasys_Processing.py --generate_   
+```sh
+  python3 Anasys_Processing.py --generate
+```
 (You can specify a custom name: python _Anasys_Processing.py --generate path/my_settings.json_)
 - **Run the Pipeline** \
   Execute the script by passing your configured JSON file as an argument:
-
-  _python3 Anasys_Processing.py config.json_
-
+```sh
+python3 Anasys_Processing.py config.json
+```
 ## 2. Configuration Parameters (config.json)
 The following tables define all allowable parameters in the configuration file.
 ### Core Data & File Selection
