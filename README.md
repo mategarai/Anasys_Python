@@ -20,11 +20,11 @@ Make sure `Anasys_Processing.py` is in the same folder as `snom_utils.py`.
 ```sh
   python3 Anasys_Processing.py --generate
 ```
-(You can specify a custom name: python _Anasys_Processing.py --generate "path/my_settings.json"_)
+(You can specify a custom name: python _Anasys_Processing.py --generate 'path/my_settings.json'_)
 - **Run the Pipeline** \
   Execute the script by passing your configured JSON file as an argument:
 ```sh
-python3 Anasys_Processing.py "path/config.json"
+python3 Anasys_Processing.py 'path/config.json'
 ```
 ## 2. Configuration Parameters (config.json)
 The following tables define all allowable parameters in the configuration file.
