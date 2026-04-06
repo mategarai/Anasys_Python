@@ -820,7 +820,6 @@ def calibrate_start_point(target_folder):
         tuple: (relative_x, relative_y) as a fraction of the scan size (0.0 to 1.0).
     """
 
-    # Spyder already has a Qt App running in the background.
     # This grabs it without trying to start a conflicting second one.
     app = QApplication.instance()
     if app is None:
@@ -828,7 +827,8 @@ def calibrate_start_point(target_folder):
 
     initial_dir = str(Path(target_folder).resolve())
 
-    print("Opening Qt file browser...")
+    print("Opening file browser...")
+    print("Select AFM Image for Calibration")
     # Open the native Qt file dialog
     img_path_str, _ = QFileDialog.getOpenFileName(
         None,
@@ -887,8 +887,8 @@ def calibrate_start_point(target_folder):
     print(
         f"First point is at {rel_x*100:.1f}% width, {rel_y*100:.1f}% height (from bottom)."
     )
-
-    return rel_x, rel_y
+    
+    return [float(rel_x), float(rel_y)]
 
 
 def extract_axz_interferogram(spectrum_dict, target_signal):
@@ -2104,42 +2104,49 @@ def save_afm_images(data_dict, output_folder, file_format="csv"):
                 np.savetxt(save_path, img_matrix, delimiter=",")
             elif file_format.lower() == "gwy":
                 try:
-                    phys_x_raw = float(
-                        scan.get("Size", {}).get("X", {}).get("Text", 1.0)
-                    )
-                    phys_y_raw = float(
-                        scan.get("Size", {}).get("Y", {}).get("Text", 1.0)
-                    )
+                    phys_x_raw = float(scan.get("Size", {}).get("X", {}).get("Text", 1.0))
+                    phys_y_raw = float(scan.get("Size", {}).get("Y", {}).get("Text", 1.0))
 
+                    # 1. Scale physical dimensions to base meters
                     phys_x_m = phys_x_raw * 1e-6
                     phys_y_m = phys_y_raw * 1e-6
 
-                    # 1. Explicitly define Gwyddion unit objects
-                    unit_xy = gwyfile.objects.GwySIUnit(unitstr="um")
-                    unit_z = gwyfile.objects.GwySIUnit(unitstr=z_unit)
+                    # 2. Map the extracted prefix to its mathematical multiplier
+                    prefix_multipliers = {
+                        "m": 1e-3,  # milli
+                        "u": 1e-6,  # micro
+                        "n": 1e-9,  # nano
+                        "p": 1e-12, # pico
+                        "": 1.0     # no prefix
+                    }
+                    
+                    # Convert the raw matrix values to the base unit (e.g., nm -> m)
+                    z_multiplier = prefix_multipliers.get(prefix.lower(), 1.0)
+                    base_img_matrix = img_matrix.astype(np.float64) * z_multiplier
 
-                    # 2. Cast the matrix to float64 and assign the unit objects
+                    # 3. Explicitly define Gwyddion unit objects using BASE units
+                    unit_xy = gwyfile.objects.GwySIUnit(unitstr="m")
+                    unit_z = gwyfile.objects.GwySIUnit(unitstr=base_unit) # Pass "m" or "V", not "nm" or "mV"
+
+                    # 4. Package the data field
                     data_field = gwyfile.objects.GwyDataField(
-                        img_matrix.astype(np.float64),
+                        base_img_matrix,
                         xreal=phys_x_m,
                         yreal=phys_y_m,
                         si_unit_xy=unit_xy,
                         si_unit_z=unit_z,
                     )
 
-                    # 3. Package it into a Gwyddion container
+                    # 5. Save the container to disk
                     container = gwyfile.objects.GwyContainer()
                     container["/0/data/title"] = clean_label
                     container["/0/data"] = data_field
 
-                    # 4. Save the container to disk
                     save_path = output_dir / f"{clean_label}.gwy"
                     container.tofile(str(save_path))
 
                 except ImportError:
-                    print(
-                        "The 'gwyfile' library is required to save native .gwy files. Saving as .csv instead."
-                    )
+                    print("The 'gwyfile' library is required to save native .gwy files. Saving as .csv instead.")
                     save_path = output_dir / f"{clean_label}_({z_unit}).csv"
                     np.savetxt(save_path, img_matrix, delimiter=",")
         except ValueError:

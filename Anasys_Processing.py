@@ -68,6 +68,7 @@ class ProcessSettings:
     map_parameter: List[str] = field(default_factory=list)
     shared_colormap: bool = False
     interpolation_res: int = field(default_factory=int)
+    relative_array_coords: List[float] = field(default_factory=list)
 
     correlations_to_check: List[tuple] = field(default_factory=list)
 
@@ -383,7 +384,15 @@ def process_afm_drift(
     if not config.drift_correct:
         return
 
-    calibration_result = snom_utils.calibrate_start_point(target_folder)
+    if not config.relative_array_coords:
+        calibration_result = snom_utils.calibrate_start_point(target_folder)
+    else:
+        calibration_result = config.relative_array_coords
+    
+
+    print(f"Relative array coordinates: {calibration_result}")
+    
+    
     if calibration_result is None:
         print("Skipping spectra alignment (calibration aborted).")
         return
