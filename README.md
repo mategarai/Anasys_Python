@@ -3,15 +3,19 @@
 The Anasys_Processing.py pipeline automates the extraction, processing, and visualization of Anasys NanoIR s-SNOM data. It processes raw interferograms from both hyperspectral maps (.axz files) and point spectra (.txt files), performs phase correction using a master reference, fits analytical models to the spectral data, and projects the fit results onto drift-corrected AFM topography scans. The workflow is controlled via a single JSON configuration file.
 
 ## 0. Required modules
-**axz_parser.py** This module handles the extraction of Anasys .axz container files and the parsing of their internal XML structures into accessible Python dictionaries.
+`axz_parser.py` This module handles the extraction of Anasys .axz container files and the parsing of their internal XML structures into accessible Python dictionaries.
 
-**snom_utils.py** list of all helper functions for data processing, handling and plotting
+`snom_utils.py` list of all helper functions for data processing, handling and plotting
 
-**installpackages.py** installs all required packages
+`installpackages.py` installs all required packages
+
+`Anasys_Processing.py` Main code used to process .axz data and .txt spectra
+
+Make sure `Anasys_Processing.py` is in the same folder as `snom_utils.py`.
 
 ## 1. Execution Instructions
 - **Generate a Template Configuration File** \
-  To create a blank configuration file with default settings in your current directory:
+  Each measurement file or collection of files should have its own config.json file. This ensures that the data processing is reproducible and saved, and prevents having to reconfigure ref. files, fitting parameters etc. every time one wishes to process an array spectrum or related point spectra. To create a blank configuration file with default settings in your current directory:
 
   _python3 Anasys_Processing.py --generate_   
 (You can specify a custom name: python _Anasys_Processing.py --generate path/my_settings.json_)
