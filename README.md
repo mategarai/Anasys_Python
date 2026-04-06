@@ -63,6 +63,6 @@ The following tables define all allowable parameters in the configuration file.
 | `shared_colormap` | Boolean | true, false | Locks the colormap limits across all generated spatial maps based on global minimum and maximum values. |
 | `array_scan_dim` | List [Integer] | e.g., [10, 10] | The [X, Y] dimensions of the scan grid. Used for reconstructing regular meshes during high-resolution interpolation. If empty, it calculates it automatically based on coordinate values |
 | `interpolation_res` | Integer | e.g., 3 | The upsampling factor for the interpolated spatial heatmaps.
-| `relative_array_coords` | List [Float] | e.g., [0.12342,0.289218] | calibrated relative array start point on first AFM scan. If left empty the user can select it manually. The coordinates will be printed as "Relative array coordinates:" in the terminal. |
+| `relative_array_coords` | List [Float] | e.g., [0.12342,0.289218] | Calibrated relative array start point on first AFM scan. If left empty the user can select it manually. The coordinates will be printed as "Relative array coordinates:" in the terminal. |
 
 
