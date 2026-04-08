@@ -18,6 +18,8 @@ import xarray as xr
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 
+import Fitting_module as pfm
+
 try:
     # Check if we are in Spyder / IPython
     get_ipython()
@@ -42,7 +44,7 @@ class ProcessSettings:
     samp_nums: List[str] = field(default_factory=list)
     ref_nums: List[str] = field(default_factory=list)
     target_signal: str = "//ZI/DEV533/DEMODS/1/X"
-    ref_format: str = "{num}_AuRef_intfgm2D_2.txt"
+    ref_format: str = "{num}_AuRef_intfgm2D_1.txt"
     plotlims: List[float] = field(default_factory=list)
     phase_fit_regions: List[tuple] = field(default_factory=list)
 
@@ -69,11 +71,32 @@ class ProcessSettings:
     shared_colormap: bool = False
     interpolation_res: int = field(default_factory=int)
     relative_array_coords: List[float] = field(default_factory=list)
+    plotgrid_n: int = 4
 
     correlations_to_check: List[tuple] = field(default_factory=list)
 
     EXPORT: bool = True
     export_foldername: Optional[str] = None
+    
+    # --- PDM Fitting Toggles ---
+    pdm_fit: bool = False
+    pdm_profile: str = "voigt"
+    pdm_plot_every: int = 10
+    
+    # --- Flat PDM Parameters ---
+    eps_guess: float = 1.0
+    slope_guess: float = -0.0003
+    A_guess: float = 50000.0
+    x0_guess: float = 1622.0
+    sigma_guess: float = 6.0
+    gamma_guess: float = 6.0
+    eps_bounds: List[float] = field(default_factory=lambda: [0.5, 2.0])
+    slope_bounds: List[float] = field(default_factory=lambda: [-1.0, 1.0])
+    A_bounds: List[float] = field(default_factory=lambda: [1000.0, 60000.0])
+    x0_bounds: List[float] = field(default_factory=lambda: [1595.0, 1680.0])
+    sigma_bounds: List[float] = field(default_factory=lambda: [4.0, 8.0])
+    gamma_bounds: List[float] = field(default_factory=lambda: [4.0, 8.0])
+
 
     def __post_init__(self):
         # Only attempt to extract values if plotlims is populated
@@ -121,6 +144,7 @@ def _extract_target_signal(
         "real": (np.real(normalized_sample), r"Re($S/R$)"),
         "imaginary": (-np.imag(normalized_sample), r"Im($S/R$)"),
         "imag": (-np.imag(normalized_sample), r"Im($S/R$)"),
+        "complex": (normalized_sample, r"$S/R$")
     }
 
     data, label = sig_map.get(
@@ -190,6 +214,8 @@ def _process_and_plot_samples(
             
     normalized_sample = flat_sample_spectra / aligned_reference
     target_da, y_label = _extract_target_signal(normalized_sample, config.signal_type)
+    
+    complex_da, ycomp_label = _extract_target_signal(normalized_sample, "complex")
 
     # --- Plotting & Output ---
     if config.plot_intfgm:
@@ -210,10 +236,19 @@ def _process_and_plot_samples(
         if config.EXPORT:
             # --- Dynamically name the file so Arrays and Points don't overwrite each other ---
             safe_title = title_label.replace(" ", "_")
-            save_filename = export_dir / f"{safe_title}_spectra_output.csv"
+            save_filename = export_dir / f"{safe_title}_{config.signal_type}_spectra_output.csv"
+            save_complex_filename = export_dir / f"{safe_title}_complex_spectra_output.csv"
+            save_complextranspose_filename = export_dir / f"{safe_title}_complex_transpose_spectra_output.csv"
 
             target_da.to_pandas().to_csv(save_filename)
+            complex_da.to_pandas().to_csv(save_complex_filename)
             print(f"Processed spectra saved to: {save_filename.name}")
+            print(f"Processed spectra saved to: {save_complex_filename.name}")
+            
+            df = complex_da.T.to_pandas()
+            df = df.dropna(how='all')
+            df = df.astype(str).replace({r'\(': '', r'\)': ''}, regex=True)
+            df.to_csv(save_complextranspose_filename, header=False)
 
         target_da.mean(dim="point").plot.line(
             x="wavenumber", hue="point", ax=ax2, add_legend=False, color="red"
@@ -223,9 +258,60 @@ def _process_and_plot_samples(
         ax2.set_ylabel(y_label)
         plt.show()
 
+
+
+    if config.pdm_fit:
+        
+        # 1. Keep native complex numbers. Do not convert to strings.
+        df = complex_da.T.to_pandas().dropna(how='all')
+        
+        results = pfm.process_spectra_array(
+            data_input=df,
+            profile=config.pdm_profile,
+            peak_centers=config.peak_centers,
+            center_tolerance=config.center_tolerance,
+            fit_window=config.plotlims if config.plotlims else None,
+            baseline_regions=config.phase_fit_regions,
+            
+            # Explicit flat parameters
+            eps_guess=config.eps_guess,
+            slope_guess=config.slope_guess,
+            A_guess=config.A_guess,
+            sigma_guess=config.sigma_guess,
+            gamma_guess=config.gamma_guess,
+            eps_bounds=config.eps_bounds,
+            slope_bounds=config.slope_bounds,
+            A_bounds=config.A_bounds,
+            sigma_bounds=config.sigma_bounds,
+            gamma_bounds=config.gamma_bounds
+        )
+        
+        # 4. Plot 2D maps only if the dataset is a 2D array
+        if "Array" in title_label and len(config.array_scan_dim) == 2:
+            pfm.plot_2d_maps(
+                results, 
+                nx=config.array_scan_dim[0], 
+                ny=config.array_scan_dim[1],
+                profile=config.pdm_profile
+            )
+        
+        if config.plot_fitresults:
+            # 5. Plot the individual fits
+            pfm.plot_individual_fits(
+                results, 
+                profile=config.pdm_profile, 
+                num_peaks=len(config.peak_centers), 
+                plot_every=config.pdm_plot_every, 
+                show_individual_peaks=True,
+                grid_n=config.plotgrid_n
+            )
+    
+    
     # --- Fitting ---
     fit_results_df = None
+    
     if config.fit_spectra:
+        
         fit_results_df = snom_utils.fit_all_spectra(
             da=target_da,
             wmin=config.fit_wmin,
@@ -234,8 +320,9 @@ def _process_and_plot_samples(
             shape=config.peak_shape,
             center_tolerance=config.center_tolerance,
             fwhm_bounds=config.fwhm_bounds,
-            grid_n=5 if config.plot_fitresults else 0,
+            grid_n=config.plotgrid_n if config.plot_fitresults else 0,
         )
+        
         if config.plot_fitstatistics and config.correlations_to_check:
             snom_utils.plot_correlations(fit_results_df, config.correlations_to_check)
 
@@ -332,7 +419,11 @@ def process_spectra(target_folder: Path, config: ProcessSettings):
     if config.samp_nums:
         
         # Scan the directory once
-        all_intfgm_files = list(target_folder.glob("*intfgm2D_2.txt"))
+        all_intfgm_files = list(target_folder.glob(f"*{config.ref_format[-15:]}"))
+        lsamp = len(all_intfgm_files)
+        
+        print(f"{lsamp}")
+        print(f"*{config.ref_format[-15:]}")
         
         samp_files = [
             f for f in all_intfgm_files 

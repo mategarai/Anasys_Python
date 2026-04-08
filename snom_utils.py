@@ -947,11 +947,10 @@ def package_axz_interferograms(data, target_signal):
         all_intensities.append(intensity)
         all_stage_positions.append(stage_pos)
 
-    # Convert lists to 2D NumPy arrays (Shape: 64 rows, N columns)
-    intensity_matrix = np.array(all_intensities)
+    # Convert lists to 2D NumPy arrays (Shape: #points rows, N columns)
+    intensity_matrix = np.array(all_intensities)/1e6  # This is in uV divide by 1e6 for Volts
     stage_position_matrix = np.array(all_stage_positions)
-
-    num_points = intensity_matrix.shape[0]  # This will be 64
+    num_points = intensity_matrix.shape[0]  # number of points
     num_steps = intensity_matrix.shape[1]  # The length of the interferogram
 
     # 3. Build the simplified xarray
@@ -1436,8 +1435,10 @@ def _generate_peak_model(n_peaks, shape, x_center):
         y_calc = np.zeros_like(x_vals)
         for i in range(n_peaks):
             a, c, w = params[i * 3 : i * 3 + 3]
+            
             if shape == "gaussian":
                 y_calc += a * np.exp(-((x_vals - c) ** 2) / (2 * w**2))
+                
             elif shape == "lorentzian":
                 y_calc += a * (w**2 / ((x_vals - c) ** 2 + w**2))
 
@@ -1641,7 +1642,7 @@ def fit_all_spectra(
     for i in range(num_points):
         y_raw = y_matrix[i]
 
-        # --- THE FIX: Mask out any isolated NaNs/Infs in this specific row ---
+        # --- Mask out any isolated NaNs/Infs in this specific row ---
         valid_mask = np.isfinite(y_raw)
 
         # Handle rows that are entirely NaN or have too few points to fit safely
