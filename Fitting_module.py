@@ -142,10 +142,10 @@ def detrend_real_keep_im_fast(z, x, detrend_context):
 
 def fit_single_pixel(args):
     """Worker function for parallel processing. Must be at root module level."""
-    i, y_target, p0_i, bounds_i, x_data, detrend_context, profile, max_nfev = args
+    i, y_target, p0_i, bounds_i, x_data, detrend_context, profile, max_nfev, bulk_sample = args
 
     def model_ri_detrended_wrapper(x, *p):
-        z = PDM.PDM_fitting(x, *p, profile=profile)
+        z = PDM.PDM_fitting(x, *p, profile=profile, bulk_sample=bulk_sample)
         zcorr, _, _ = detrend_real_keep_im_fast(z, x, detrend_context)
         return stack_ri(zcorr)
 
@@ -176,7 +176,7 @@ def process_spectra_array_old(
     baseline_regions=None,
     p0_overrides=None,
     bounds_overrides=None,
-    max_nfev=3000000,
+    max_nfev=30000,
     **defaults
 ):
     if profile not in PROFILE_PARAM_COUNT:
@@ -273,7 +273,7 @@ def process_spectra_array_old(
                 percent_float = completed / M
                 filled_length = int(20 * percent_float)
                 bar = "=" * filled_length + "-" * (20 - filled_length)
-                print(f"\rFitting Spectra: [{bar}] {int(percent_float * 100)}% ({completed}/{M})", end="", flush=True)
+                print(f"\rPDM Fitting Spectra: [{bar}] {int(percent_float * 100)}% ({completed}/{M})", end="", flush=True)
 
     toc = time.perf_counter()
     print(f"\n\nSuccessful fits: {np.sum(fit_success)} / {M}")
@@ -304,7 +304,8 @@ def process_spectra_array(
     # Strictly flat kwargs
     eps_guess=1.0, slope_guess=-0.0003, A_guess=50000.0, sigma_guess=6.0, gamma_guess=6.0,
     eps_bounds=(0.5, 2.0), slope_bounds=(-1.0, 1.0), A_bounds=(1000.0, 60000.0), 
-    sigma_bounds=(4.0, 8.0), gamma_bounds=(4.0, 8.0)
+    sigma_bounds=(4.0, 8.0), gamma_bounds=(4.0, 8.0),
+    bulk_sample=False
 ):
     if not peak_centers:
         raise ValueError("peak_centers list must be provided.")
@@ -368,7 +369,7 @@ def process_spectra_array(
     
     # Parallel Execution Setup
     tasks = [
-        (i, stack_ri(spectra_fit_norm[:, i]), p0, bounds, x_fit, detrend_context, profile, max_nfev) 
+        (i, stack_ri(spectra_fit_norm[:, i]), p0, bounds, x_fit, detrend_context, profile, max_nfev,bulk_sample) 
         for i in range(M)
     ]
     fit_params = np.full((M, len(p0)), np.nan, dtype=float)
@@ -543,7 +544,7 @@ def plot_2d_maps(results, nx, ny, profile="voigt"):
     plt.show()
 
 
-def get_individual_peaks(x, popt, num_peaks, profile, detrend_context):
+def get_individual_peaks(x, popt, num_peaks, profile, detrend_context,bulk_sample):
     """Generates detrended line shapes for individual peaks."""
     pcount = PROFILE_PARAM_COUNT[profile]
     base_idx = 2  # indices 0 and 1 are eps and slope
@@ -560,7 +561,7 @@ def get_individual_peaks(x, popt, num_peaks, profile, detrend_context):
                 popt_single[A_idx] = 0.0
                 
         # Evaluate single peak model and detrend
-        z_single = PDM.PDM_fitting(x, *popt_single, profile=profile)
+        z_single = PDM.PDM_fitting(x, *popt_single, profile=profile,bulk_sample=bulk_sample)
         z_single_det, _, _ = detrend_real_keep_im_fast(z_single, x, detrend_context)
         peaks_detrended.append(z_single_det)
         
@@ -569,7 +570,7 @@ def get_individual_peaks(x, popt, num_peaks, profile, detrend_context):
 
 
 
-def plot_individual_fits(results, profile="voigt", num_peaks=2, plot_every=10, show_individual_peaks=True, grid_n=5):
+def plot_individual_fits(results, profile="voigt", num_peaks=2, plot_every=10, show_individual_peaks=True, grid_n=5,bulk_sample=False):
     """Plots grouped manual previews for individual pixels on n x n grids."""
     if not plot_every:
         return
@@ -612,7 +613,7 @@ def plot_individual_fits(results, profile="voigt", num_peaks=2, plot_every=10, s
         axs_cmp_flat = np.array(axs_cmp).flatten()
 
         for idx, i in enumerate(chunk):
-            zhat_raw = PDM.PDM_fitting(x_fit, *fit_params[i, :], profile=profile)
+            zhat_raw = PDM.PDM_fitting(x_fit, *fit_params[i, :], profile=profile,bulk_sample=bulk_sample)
             zhat_det, _, _ = detrend_real_keep_im_fast(zhat_raw, x_fit, detrend_context)
 
             m, b = re_drift_mb[i]
@@ -640,7 +641,7 @@ def plot_individual_fits(results, profile="voigt", num_peaks=2, plot_every=10, s
             # ax.set_box_aspect(1)
             
             if show_individual_peaks:
-                peaks_det = get_individual_peaks(x_fit, fit_params[i, :], num_peaks, profile, detrend_context)
+                peaks_det = get_individual_peaks(x_fit, fit_params[i, :], num_peaks, profile, detrend_context,bulk_sample=bulk_sample)
                 for p_idx, peak_z in enumerate(peaks_det):
                     ax.plot(x_fit, peak_z.imag, ':', label=f"Peak {p_idx+1} Im")
 

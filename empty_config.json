@@ -6,7 +6,7 @@
     "samp_nums": [],
     "ref_nums": [],
     "target_signal": "//ZI/DEV533/DEMODS/1/X",
-    "ref_format": "{num}_AuRef_intfgm2D_2.txt",
+    "ref_format": "{num}_AuRef_intfgm2D_1.txt",
     "plotlims": [],
     "phase_fit_regions": [],
     "plot_intfgm": false,
@@ -29,7 +29,37 @@
     "shared_colormap": false,
     "interpolation_res": 0,
     "relative_array_coords": [],
+    "plotgrid_n": 4,
     "correlations_to_check": [],
     "EXPORT": true,
-    "export_foldername": null
+    "export_foldername": null,
+    "pdm_fit": false,
+    "pdm_profile": "voigt",
+    "pdm_plot_every": 1,
+    "bulk_sample": false,
+    "eps_guess": 1.0,
+    "slope_guess": 0,
+    "A_guess": 50000.0,
+    "sigma_guess": 10.0,
+    "gamma_guess": 10.0,
+    "eps_bounds": [
+        0.0,
+        100.0
+    ],
+    "slope_bounds": [
+        -0.1,
+        0.1
+    ],
+    "A_bounds": [
+        0,
+        1000000000.0
+    ],
+    "sigma_bounds": [
+        1.0,
+        20.0
+    ],
+    "gamma_bounds": [
+        1.0,
+        20.0
+    ]
 }

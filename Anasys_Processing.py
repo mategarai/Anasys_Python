@@ -81,21 +81,20 @@ class ProcessSettings:
     # --- PDM Fitting Toggles ---
     pdm_fit: bool = False
     pdm_profile: str = "voigt"
-    pdm_plot_every: int = 10
+    pdm_plot_every: int = 1
     
     # --- Flat PDM Parameters ---
+    bulk_sample: bool = False
     eps_guess: float = 1.0
-    slope_guess: float = -0.0003
-    A_guess: float = 50000.0
-    x0_guess: float = 1622.0
-    sigma_guess: float = 6.0
-    gamma_guess: float = 6.0
-    eps_bounds: List[float] = field(default_factory=lambda: [0.5, 2.0])
-    slope_bounds: List[float] = field(default_factory=lambda: [-1.0, 1.0])
-    A_bounds: List[float] = field(default_factory=lambda: [1000.0, 60000.0])
-    x0_bounds: List[float] = field(default_factory=lambda: [1595.0, 1680.0])
-    sigma_bounds: List[float] = field(default_factory=lambda: [4.0, 8.0])
-    gamma_bounds: List[float] = field(default_factory=lambda: [4.0, 8.0])
+    slope_guess: float = 0
+    A_guess: float = 5.0e4
+    sigma_guess: float = 10.0
+    gamma_guess: float = 10.0
+    eps_bounds: List[float] = field(default_factory=lambda: [0.0,100.0])
+    slope_bounds: List[float] = field(default_factory=lambda: [-0.1,0.1])
+    A_bounds: List[float] = field(default_factory=lambda: [0,1e9])
+    sigma_bounds: List[float] = field(default_factory=lambda: [1.0, 20.0])
+    gamma_bounds: List[float] = field(default_factory=lambda: [1.0, 20.0])
 
 
     def __post_init__(self):
@@ -258,7 +257,8 @@ def _process_and_plot_samples(
         ax2.set_ylabel(y_label)
         plt.show()
 
-
+    # --- Fitting ---
+    fit_results_df = None
 
     if config.pdm_fit:
         
@@ -283,17 +283,18 @@ def _process_and_plot_samples(
             slope_bounds=config.slope_bounds,
             A_bounds=config.A_bounds,
             sigma_bounds=config.sigma_bounds,
-            gamma_bounds=config.gamma_bounds
+            gamma_bounds=config.gamma_bounds,
+            bulk_sample=config.bulk_sample
         )
         
         # 4. Plot 2D maps only if the dataset is a 2D array
-        if "Array" in title_label and len(config.array_scan_dim) == 2:
-            pfm.plot_2d_maps(
-                results, 
-                nx=config.array_scan_dim[0], 
-                ny=config.array_scan_dim[1],
-                profile=config.pdm_profile
-            )
+        # if len(config.array_scan_dim) == 2:
+        #     pfm.plot_2d_maps(
+        #         results, 
+        #         nx=config.array_scan_dim[0], 
+        #         ny=config.array_scan_dim[1],
+        #         profile=config.pdm_profile
+        #     )
         
         if config.plot_fitresults:
             # 5. Plot the individual fits
@@ -303,12 +304,87 @@ def _process_and_plot_samples(
                 num_peaks=len(config.peak_centers), 
                 plot_every=config.pdm_plot_every, 
                 show_individual_peaks=True,
-                grid_n=config.plotgrid_n
+                grid_n=config.plotgrid_n,
+                bulk_sample=config.bulk_sample
             )
+        
+        
+        fit_params = results["fit_params"]
+        fit_success = results["fit_success"]
+        P = fit_params.shape[1]
+        
+        # 1. Base labels for raw parameters
+        param_labels = ["eps", "slope"]
+        pcount = pfm.PROFILE_PARAM_COUNT[config.pdm_profile.lower()]
+        num_peaks = (P - 2) // pcount
+
+        # Build initial raw columns
+        for i in range(1, num_peaks + 1):
+            param_labels.extend([f"peak_{i}_amplitude", f"peak_{i}_center"])
+            if config.pdm_profile.lower() == "gaussian":
+                param_labels.append(f"peak_{i}_sigma")
+            elif config.pdm_profile.lower() == "lorentzian":
+                param_labels.append(f"peak_{i}_gamma")
+            elif config.pdm_profile.lower() == "voigt":
+                param_labels.extend([f"peak_{i}_sigma", f"peak_{i}_gamma"])
+        
+        pdm_fit_df = pd.DataFrame(fit_params, columns=param_labels)
+        
+        # 2. Calculate FWHM and Area to match the requested format
+        ordered_cols = ["point", "fit_success", "eps", "slope"]
+        
+        for i in range(1, num_peaks + 1):
+            amp = pdm_fit_df[f"peak_{i}_amplitude"]
+            
+            # Convert raw widths to FWHM
+            if config.pdm_profile.lower() == "lorentzian":
+                # For a physical oscillator, Gamma is effectively the FWHM
+                fwhm = pdm_fit_df[f"peak_{i}_gamma"]  
+            elif config.pdm_profile.lower() == "gaussian":
+                fwhm = pdm_fit_df[f"peak_{i}_sigma"] * 2.355
+            elif config.pdm_profile.lower() == "voigt":
+                f_g = pdm_fit_df[f"peak_{i}_sigma"] * 2.355
+                f_l = pdm_fit_df[f"peak_{i}_gamma"]
+                # Voigt FWHM approximation
+                fwhm = 0.5346 * f_l + np.sqrt(0.2166 * f_l**2 + f_g**2)
+            
+            # Assign calculated columns
+            pdm_fit_df[f"peak_{i}_fwhm"] = fwhm
+            pdm_fit_df[f"peak_{i}_area"] = amp * fwhm  
+            
+            # Append to the ordered list
+            ordered_cols.extend([
+                f"peak_{i}_center", 
+                f"peak_{i}_amplitude", 
+                f"peak_{i}_fwhm",
+                f"peak_{i}_area"
+            ])
+            
+            # Keep Voigt-specific raw parameters if needed
+            if config.pdm_profile.lower() == "voigt":
+                ordered_cols.extend([f"peak_{i}_sigma", f"peak_{i}_gamma"])
+
+        # 3. Add Metadata
+        pdm_fit_df["point"] = range(results["M"])
+        pdm_fit_df["fit_success"] = fit_success
+        
+        # Reorder DataFrame
+        pdm_fit_df = pdm_fit_df[ordered_cols]
+        fit_results_df = pdm_fit_df
+        
+        # --- Export PDM Fit Results ---
+        if config.EXPORT:
+            safe_title = title_label.replace(" ", "_")
+            save_filename_pdm = export_dir / f"{safe_title}_PDM_fit_results.csv"
+            
+            pdm_fit_df.to_csv(save_filename_pdm, index=False)
+            print(f"PDM Fit results saved to: {save_filename_pdm.name}")
+        
     
     
-    # --- Fitting ---
-    fit_results_df = None
+    if config.pdm_fit:
+        if config.plot_fitstatistics and config.correlations_to_check:
+            snom_utils.plot_correlations(fit_results_df, config.correlations_to_check)
     
     if config.fit_spectra:
         
@@ -325,6 +401,7 @@ def _process_and_plot_samples(
         
         if config.plot_fitstatistics and config.correlations_to_check:
             snom_utils.plot_correlations(fit_results_df, config.correlations_to_check)
+        
 
         if config.EXPORT:
             safe_title = title_label.replace(" ", "_")
@@ -382,8 +459,10 @@ def process_spectra(target_folder: Path, config: ProcessSettings):
         data = load_axz_as_dict(axz_file)
         
         # --- DEFINE ARRAY EXPORT FOLDER ---
-        array_export_name = config.export_foldername if config.export_foldername else f"Extracted_Data_Array_{config.array_num}"
-        array_export_dir = target_folder / array_export_name
+        if config.export_foldername:
+            array_export_dir = Path(config.export_foldername) / f"Extracted_Data_Array_{config.array_num}"
+        else:
+            array_export_dir = target_folder / f"Extracted_Data_Array_{config.array_num}"
         
         if config.EXPORT:
             snom_utils.export_axz_contents(
@@ -432,8 +511,11 @@ def process_spectra(target_folder: Path, config: ProcessSettings):
         
         if samp_files:
             # --- DEFINE POINT SPECTRA EXPORT FOLDER ---
-            point_export_name = config.export_foldername if config.export_foldername else "Extracted_Data_Point_Spectra"
-            point_export_dir = target_folder / point_export_name
+            if config.export_foldername:
+                point_export_dir = Path(config.export_foldername) / "Extracted_Data_Point_Spectra"
+            else:
+                point_export_dir = target_folder / "Extracted_Data_Point_Spectra"
+
             sample_interfs = snom_utils.package_point_interferograms(samp_files)
             _process_and_plot_samples(
                 sample_interfs,
@@ -499,10 +581,18 @@ def process_afm_drift(
         grid_shape=config.array_scan_dim,
     )
     if config.EXPORT:
-        array_export_name = config.export_foldername if config.export_foldername else f"Extracted_Data_Array_{config.array_num}"
-        save_folder = (
-            target_folder / array_export_name / "corrected_coordinates.csv"
-        )
+        
+        if config.export_foldername:
+            array_export_dir = Path(config.export_foldername)
+            save_folder = (
+                Path(config.export_foldername) / "corrected_coordinates.csv"
+            )
+        else:
+            array_export_dir = target_folder / f"Extracted_Data_Array_{config.array_num}"
+            save_folder = (
+                array_export_dir / "corrected_coordinates.csv"
+            )
+            
         df.to_csv(save_folder, index=False)
         print(f"Corrected map coordinates saved to: {save_folder}")
 

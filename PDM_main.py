@@ -323,7 +323,7 @@ def build_eps_sample(x, eps_inf, num_osc, osc_args, profile="lorentz", N_INH=21,
 _pdm_cache = {'x_arr': np.array([])}
 
 def PDM(x, numOsc, eps_inf, *osc_args, profile="lorentzian",
-        d_film_nm=300.0, theta_deg=30.0, N_INH=21, span=4.0):
+        d_film_nm=300.0, theta_deg=30.0, N_INH=21, span=4.0, bulk_sample=False):
 
     x = np.asarray(x, dtype=float)
 
@@ -360,16 +360,18 @@ def PDM(x, numOsc, eps_inf, *osc_args, profile="lorentzian",
     kz0 = _pdm_cache['kz0']
     kz2 = _pdm_cache['kz2']
 
-    # Evaluate dynamic sample calculations
     E_samp = build_eps_sample(x, eps_inf, numOsc, osc_args,
                               profile=profile, N_INH=N_INH, span=span)
 
     Beta_samp = (E_samp - 1.0) / (E_samp + 1.0)
     
-    # Route to the optimized Fresnel function
-    rp_samp = fresnel_rp_layered_fast(
-        E_samp, d_film_nm, E_gold, kz0, kz2, k0, theta_deg=theta_deg, eps0=1.0
-    )
+    # Route to the correct Fresnel function
+    if bulk_sample:
+        rp_samp = fresnel_rp_halfspace(E_samp, theta_deg=theta_deg, eps0=1.0)
+    else:
+        rp_samp = fresnel_rp_layered_fast(
+            E_samp, d_film_nm, E_gold, kz0, kz2, k0, theta_deg=theta_deg, eps0=1.0
+        )
 
     s2_samp = LockIn_complex(Beta_samp, rp_samp, alpha_0, 1.0)
     return s2_samp / s2_ref
@@ -379,13 +381,13 @@ def PDM(x, numOsc, eps_inf, *osc_args, profile="lorentzian",
 # Fitting wrapper
 # =============================================================================
 def PDM_fitting(x, eps_inf, slope, *osc_args,
-                profile="lorentzian", d_film_nm=1.0, theta_deg=30.0, N_INH=21, span=4.0):
+                profile="lorentzian", d_film_nm=1.0, theta_deg=30.0, N_INH=21, span=4.0,bulk_sample=False):
     # infer numOsc from osc_args and profile
     pcount = _PROFILE_PARAM_COUNT[str(profile).lower()]
     numOsc = len(osc_args) // pcount
 
     z = PDM(x, numOsc, eps_inf, *osc_args,
-            profile=profile, d_film_nm=d_film_nm, theta_deg=theta_deg, N_INH=N_INH, span=span)
+            profile=profile, d_film_nm=d_film_nm, theta_deg=theta_deg, N_INH=N_INH, span=span,bulk_sample=bulk_sample)
 
     # Keep your minimal real-only linear baseline tweak on the real part
     # (still OK because you detrend both model+data inside the objective)

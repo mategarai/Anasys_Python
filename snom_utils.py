@@ -1865,8 +1865,9 @@ def plot_correlations(df, pairs):
         ax.set_xlabel(x_col.replace("_", " ").title())
         ax.set_ylabel(y_col.replace("_", " ").title())
         ax.grid(True, linestyle="--", alpha=0.5)
+        ax.set_box_aspect(1)
 
-        cbar = fig.colorbar(scatter, ax=ax)
+        cbar = fig.colorbar(scatter, ax=ax, shrink=0.55)
         cbar.set_label("Spectrum Point Index")
 
     # Hide any unused subplots if your list length doesn't perfectly fill the grid
