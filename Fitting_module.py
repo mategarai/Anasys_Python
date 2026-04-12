@@ -68,12 +68,42 @@ def build_fit_parameters_old(num_peaks, profile, overrides_p0=None, overrides_bo
 
     return tuple(p0), (tuple(lb), tuple(ub))
 
+
+
 def build_fit_parameters(
     profile, peak_centers, center_tolerance, 
     eps_guess, slope_guess, A_guess, sigma_guess, gamma_guess,
     eps_bounds, slope_bounds, A_bounds, sigma_bounds, gamma_bounds
 ):
     num_peaks = len(peak_centers)
+    
+    # --- Normalization Helpers ---
+    def norm_guess(g):
+        """Checks if guess is a list for multiple peaks, or a scalar to be duplicated."""
+        if isinstance(g, (list, tuple, np.ndarray)):
+            if len(g) != num_peaks:
+                raise ValueError(f"Guess list length ({len(g)}) does not match num_peaks ({num_peaks})")
+            return g
+        return [g] * num_peaks
+
+    def norm_bound(b):
+        """Checks if bounds are a list of pairs [[lo,hi], [lo,hi]], or a single pair [lo,hi] to be duplicated."""
+        # If the first element is a collection, it's a list of bounds
+        if isinstance(b[0], (list, tuple, np.ndarray)):
+            if len(b) != num_peaks:
+                raise ValueError(f"Bounds list length ({len(b)}) does not match num_peaks ({num_peaks})")
+            return b
+        # Otherwise, it's a single bound pair like (14.0, 15.0)
+        return [b] * num_peaks
+
+    # Normalize per-peak parameters
+    A_g = norm_guess(A_guess)
+    sig_g = norm_guess(sigma_guess)
+    gam_g = norm_guess(gamma_guess)
+
+    A_b = norm_bound(A_bounds)
+    sig_b = norm_bound(sigma_bounds)
+    gam_b = norm_bound(gamma_bounds)
     
     p0 = [eps_guess, slope_guess]
     lb = [eps_bounds[0], slope_bounds[0]]
@@ -86,23 +116,24 @@ def build_fit_parameters(
         x0_val = float(peak_centers[i])
         x0_bnd = (x0_val - center_tolerance, x0_val + center_tolerance)
         
-        p0.extend([A_guess, x0_val])
-        lb.extend([A_bounds[0], x0_bnd[0]])
-        ub.extend([A_bounds[1], x0_bnd[1]])
+        # Use the index 'i' to pull the specific guess/bound for this peak
+        p0.extend([A_g[i], x0_val])
+        lb.extend([A_b[i][0], x0_bnd[0]])
+        ub.extend([A_b[i][1], x0_bnd[1]])
         
-        # Apply the exact same global width guesses/bounds to every peak
+        # Apply the dynamically extracted width guesses/bounds to each peak
         if profile == "gaussian":
-            p0.append(sigma_guess)
-            lb.append(sigma_bounds[0])
-            ub.append(sigma_bounds[1])
+            p0.append(sig_g[i])
+            lb.append(sig_b[i][0])
+            ub.append(sig_b[i][1])
         elif profile == "lorentzian":
-            p0.append(gamma_guess)
-            lb.append(gamma_bounds[0])
-            ub.append(gamma_bounds[1])
+            p0.append(gam_g[i])
+            lb.append(gam_b[i][0])
+            ub.append(gam_b[i][1])
         elif profile == "voigt":
-            p0.extend([sigma_guess, gamma_guess])
-            lb.extend([sigma_bounds[0], gamma_bounds[0]])
-            ub.extend([sigma_bounds[1], gamma_bounds[1]])
+            p0.extend([sig_g[i], gam_g[i]])
+            lb.extend([sig_b[i][0], gam_b[i][0]])
+            ub.extend([sig_b[i][1], gam_b[i][1]])
 
     return tuple(p0), (tuple(lb), tuple(ub))
 
@@ -160,9 +191,16 @@ def fit_single_pixel(args):
             jac="2-point",
             max_nfev=max_nfev,
         )
-        return i, True, popt
+        
+        # --- R-squared Calculation ---
+        y_pred = model_ri_detrended_wrapper(x_data, *popt)
+        ss_res = np.sum((y_target - y_pred)**2)
+        ss_tot = np.sum((y_target - np.mean(y_target))**2)
+        r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+        
+        return i, True, popt, r_squared
     except Exception as e:
-        return i, False, str(e)
+        return i, False, str(e), np.nan
 
 # =============================================================================
 # Main Pipeline Function
@@ -248,8 +286,10 @@ def process_spectra_array_old(
         (i, stack_ri(spectra_fit_norm[:, i]), p0, bounds, x_fit, detrend_context, profile, max_nfev) 
         for i in range(M)
     ]
+    
     fit_params = np.full((M, len(p0)), np.nan, dtype=float)
     fit_success = np.zeros(M, dtype=bool)
+    fit_r2 = np.full(M, np.nan, dtype=float)
     
     num_cores = max(1, os.cpu_count() - 1)
     optimal_chunksize = max(1, M // (num_cores * 4))
@@ -260,11 +300,12 @@ def process_spectra_array_old(
     completed = 0
     with ProcessPoolExecutor(max_workers=num_cores) as executor:
         for result in executor.map(fit_single_pixel, tasks, chunksize=optimal_chunksize):
-            i, success, res_data = result
+            i, success, res_data, r2_val = result # Unpack R2
             fit_success[i] = success
             
             if success:
                 fit_params[i, :] = res_data
+                fit_r2[i] = r2_val
             else:
                 print(f"\nPixel {i:3d} FIT FAILED: {res_data}")
                 
@@ -276,6 +317,7 @@ def process_spectra_array_old(
                 print(f"\rPDM Fitting Spectra: [{bar}] {int(percent_float * 100)}% ({completed}/{M})", end="", flush=True)
 
     toc = time.perf_counter()
+    print("\nFitting complete!")
     print(f"\n\nSuccessful fits: {np.sum(fit_success)} / {M}")
     print(f"Elapsed time: {toc - tic:.4f} seconds")
 
@@ -286,6 +328,7 @@ def process_spectra_array_old(
         "spectra_fit_norm": spectra_fit_norm,
         "fit_params": fit_params,
         "fit_success": fit_success,
+        "fit_r2": fit_r2,
         "re_drift_mb": re_drift_mb,
         "im_base": im_base,
         "detrend_context": detrend_context,
@@ -374,6 +417,7 @@ def process_spectra_array(
     ]
     fit_params = np.full((M, len(p0)), np.nan, dtype=float)
     fit_success = np.zeros(M, dtype=bool)
+    fit_r2 = np.full(M, np.nan, dtype=float)
     
     num_cores = max(1, os.cpu_count() - 1)
     optimal_chunksize = max(1, M // (num_cores * 4))
@@ -384,11 +428,12 @@ def process_spectra_array(
     completed = 0
     with ProcessPoolExecutor(max_workers=num_cores) as executor:
         for result in executor.map(fit_single_pixel, tasks, chunksize=optimal_chunksize):
-            i, success, res_data = result
+            i, success, res_data, r2_val = result # Unpack R2
             fit_success[i] = success
             
             if success:
                 fit_params[i, :] = res_data
+                fit_r2[i] = r2_val
             else:
                 print(f"\nPixel {i:3d} FIT FAILED: {res_data}")
                 
@@ -397,7 +442,7 @@ def process_spectra_array(
                 percent_float = completed / M
                 filled_length = int(20 * percent_float)
                 bar = "=" * filled_length + "-" * (20 - filled_length)
-                print(f"\rFitting Spectra: [{bar}] {int(percent_float * 100)}% ({completed}/{M})", end="", flush=True)
+                print(f"\rFitting Spectra (PDM): [{bar}] {int(percent_float * 100)}% ({completed}/{M})", end="", flush=True)
 
     toc = time.perf_counter()
     print(f"\n\nSuccessful fits: {np.sum(fit_success)} / {M}")
@@ -410,6 +455,7 @@ def process_spectra_array(
         "spectra_fit_norm": spectra_fit_norm,
         "fit_params": fit_params,
         "fit_success": fit_success,
+        "fit_r2": fit_r2,
         "re_drift_mb": re_drift_mb,
         "im_base": im_base,
         "detrend_context": detrend_context,

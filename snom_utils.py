@@ -50,6 +50,10 @@ mpl.rcParams["savefig.dpi"] = 300
 # ==========================================
 
 
+def print_warning(msg: str):
+    """Prints a yellow warning message to the console."""
+    print(f"\033[93m{msg}\033[0m")
+
 class AFMArray:
 
     def __init__(self, axz_dict):
@@ -144,7 +148,7 @@ class AFMArray:
                 if scan.shape == target_shape and phys == target_phys:
                     uniform_scans.append(scan)
                 else:
-                    print(
+                    print_warning(
                         f"Warning: Scan {i} skipped due to mismatch. "
                         f"Expected shape/size {target_shape} / {target_phys}, "
                         f"got {scan.shape} / {phys}."
@@ -508,33 +512,6 @@ class AFMArray:
         # 1. Convert the relative click to physical micrometers
         local_start_x = rel_x * self.physical_size[0]
         local_start_y = rel_y * self.physical_size[1]
-
-        # # 2. Extract the absolute coordinates of all points from the XML
-        # absolute_coords = []
-        # spectra = self.raw_dict["Document"]["SNOMSpectra"]["AXDSNOMSpectrum"]
-        # if not isinstance(spectra, list):
-        #     spectra = [spectra]
-
-        # for spec in spectra:
-        #     loc = spec["Location"]
-
-        #     # X extraction
-        #     x_val = loc["X"]
-        #     if isinstance(x_val, dict):
-        #         abs_x = float(x_val.get("#text", list(x_val.values())[0]))
-        #     else:
-        #         abs_x = float(x_val)
-
-        #     # Y extraction
-        #     y_val = loc["Y"]
-        #     if isinstance(y_val, dict):
-        #         abs_y = float(y_val.get("#text", list(y_val.values())[0]))
-        #     else:
-        #         abs_y = float(y_val)
-
-        #     absolute_coords.append([abs_x, abs_y])
-
-        # absolute_coords = np.array(absolute_coords)
         
         # 2. Extract the absolute coordinates of all points
         absolute_coords = extract_raw_spectra_coords(self.raw_dict)
@@ -560,6 +537,9 @@ class AFMArray:
         shared_colormap=False,
         interp_resolution=None,
         grid_shape=None,
+        fitting_type = None,
+        afmcolormap = 'afmhot',
+        hyperspectracmap = 'jet'
     ):
         """
         Evaluates the previously saved polynomial fit for each spectrum point
@@ -644,11 +624,12 @@ class AFMArray:
         # Loop through each requested parameter
         for param in parameters_to_plot:
             fig, ax = plt.subplots(figsize=(8, 6))
+            fig.suptitle(fitting_type)
             ax.imshow(
                 self.scans[bg_scan_idx],
                 extent=extent,
                 aspect="equal",
-                cmap="afmhot",
+                cmap=afmcolormap,
                 origin="lower",
                 alpha=1,
             )
@@ -671,7 +652,7 @@ class AFMArray:
                         x_coords[valid_mask],
                         y_coords[valid_mask],
                         c=colors[valid_mask],
-                        cmap="jet",
+                        cmap=hyperspectracmap,
                         vmin=c_min,
                         vmax=c_max,
                         s=150,
@@ -710,7 +691,7 @@ class AFMArray:
                         if grid_shape is not None:
                             rows, cols = grid_shape
                             if rows * cols != len(x_coords):
-                                print(f"Warning: grid_shape {grid_shape} does not match {len(x_coords)} points. Using scatter plot only.")
+                                print_warning(f"Warning: grid_shape {grid_shape} does not match {len(x_coords)} points. Using scatter plot only.")
                                 continue
                         else:
                             # INFER GRID SHAPE FROM RAW COORDINATES
@@ -723,7 +704,7 @@ class AFMArray:
                             
                             # Validation fallback: if X * Y doesn't match total points (e.g., sparse or arbitrary points)
                             if rows * cols != len(x_coords):
-                                print(f"Warning: Inferred grid {rows}x{cols} does not match {len(x_coords)} total points. Skipping heatmap interpolation.")
+                                print_warning(f"Warning: Inferred grid {rows}x{cols} does not match {len(x_coords)} total points. Skipping heatmap interpolation.")
                                 continue
 
                         # Linear arrays (1D) cannot generate a 2D mesh surface.
@@ -732,11 +713,13 @@ class AFMArray:
                             continue
 
                         fig2, ax2 = plt.subplots(figsize=(8, 6))
+                        fig2.suptitle(fitting_type)
+                        
                         ax2.imshow(
                             self.scans[bg_scan_idx],
                             extent=extent,
                             aspect="equal",
-                            cmap="afmhot",
+                            cmap=afmcolormap,
                             origin="lower",
                             alpha=1,
                         )
@@ -761,7 +744,7 @@ class AFMArray:
                             X_highres,
                             Y_highres,
                             C_highres,
-                            cmap="jet",
+                            cmap=hyperspectracmap,
                             shading="nearest",
                             alpha=1,
                             zorder=2,
@@ -795,7 +778,7 @@ class AFMArray:
                     # =======================================================
 
                 else:
-                    print(
+                    print_warning(
                         f"Warning: '{param}' not found in fit results. Falling back to cyan"
                     )
                     ax.scatter(x_coords, y_coords, color="cyan", s=40, zorder=5)
@@ -808,6 +791,7 @@ class AFMArray:
 
         df = pd.DataFrame({"map_x": x_coords, "map_y": y_coords})
         return df
+
 
 
 def calibrate_start_point(target_folder):
@@ -1780,7 +1764,7 @@ def fit_all_spectra(
             bar = "=" * filled_length + "-" * (bar_length - filled_length)
 
             print(
-                f"\rFitting Spectra: [{bar}] {int(percent_float * 100)}% ({i + 1}/{num_points})",
+                f"\rFitting Spectra (Standard): [{bar}] {int(percent_float * 100)}% ({i + 1}/{num_points})",
                 end="",
                 flush=True,
             )
@@ -1790,11 +1774,11 @@ def fit_all_spectra(
     if do_plot:
         plt.show()
 
-    print("Fitting complete!")
+    print("\nFitting complete!")
     return pd.DataFrame(results)
 
 
-def plot_correlations(df, pairs):
+def plot_correlations(df, pairs, fitting_type):
     """
     Plots scatter correlations between user-specified pairs of fitted parameters.
 
@@ -1818,6 +1802,7 @@ def plot_correlations(df, pairs):
     fig, axes = plt.subplots(
         rows, cols, figsize=(3 * cols, 3 * rows), constrained_layout=True
     )
+    fig.suptitle(fitting_type, fontsize=16)
 
     # Force axes into a flat list even if there's only 1 plot
     if num_plots == 1:
@@ -2005,7 +1990,7 @@ def load_folder_to_xarray(
             data_dict[file.stem] = series
 
         except Exception as e:
-            print(f"Warning: Could not process '{file.name}'. Error: {e}")
+            print_warning(f"Warning: Could not process '{file.name}'. Error: {e}")
 
     # Concat aligns all files by their X-axis index automatically.
     # If one file has 400.1nm and another lacks it, Pandas fills it with NaN.
@@ -2200,14 +2185,14 @@ def save_video_pictures(data_dict, output_folder):
                         f"Saved '{clean_label}.png' ({res_x}x{res_y}, Mode: {img_mode})"
                     )
                 else:
-                    print(
+                    print_warning(
                         f"Warning: Raw image '{clean_label}' has unexpected byte ratio ({bytes_per_pixel} bytes/pixel)."
                     )
             else:
-                print(f"Warning: Could not determine resolution for '{clean_label}'.")
+                print_warning(f"Warning: Could not determine resolution for '{clean_label}'.")
 
         except Exception as e:
-            print(f"Warning: Failed to decode '{clean_label}'. Error: {e}")
+            print_warning(f"Warning: Failed to decode '{clean_label}'. Error: {e}")
 
 
 def save_all_interferograms(data_dict, output_folder):

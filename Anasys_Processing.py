@@ -36,17 +36,19 @@ plt.ion()
 @dataclass
 class ProcessSettings:
 
-    target_folder: str
+    target_folder: Path
 
     array_num: Optional[int] = None
     array_format: str = "Array_{num}.axz"
-    array_scan_dim: List[int] = field(default_factory=list)
-    samp_nums: List[str] = field(default_factory=list)
-    ref_nums: List[str] = field(default_factory=list)
+    array_scan_dim: List[int] = field(default_factory=lambda: [])
+    samp_nums: List[str] = field(default_factory=lambda: [])
+    ref_nums: List[str] = field(default_factory=lambda: [])
     target_signal: str = "//ZI/DEV533/DEMODS/1/X"
     ref_format: str = "{num}_AuRef_intfgm2D_1.txt"
-    plotlims: List[float] = field(default_factory=list)
-    phase_fit_regions: List[tuple] = field(default_factory=list)
+    plotlims: List[float] = field(default_factory=lambda: [])
+    phase_fit_regions: List[tuple] = field(default_factory=lambda: [])
+    afmcolormap: str = "afmhot"
+    hyperspectracmap: str = "jet"
 
     # --- PLOTTING TOGGLES ---
     plot_intfgm: bool = False
@@ -64,19 +66,19 @@ class ProcessSettings:
     fit_wmin: Optional[float] = None
     fit_wmax: Optional[float] = None
     peak_shape: str = "lorentzian"
-    peak_centers: List[float] = field(default_factory=list)
+    peak_centers: List[float] = field(default_factory=lambda: [])
     center_tolerance: float = field(default_factory=float)
-    fwhm_bounds: List[tuple] = field(default_factory=list)
-    map_parameter: List[str] = field(default_factory=list)
+    fwhm_bounds: List[tuple] = field(default_factory=lambda: [])
+    map_parameter: List[str] = field(default_factory=lambda: [])
     shared_colormap: bool = False
     interpolation_res: int = field(default_factory=int)
-    relative_array_coords: List[float] = field(default_factory=list)
+    relative_array_coords: List[float] = field(default_factory=lambda: [])
     plotgrid_n: int = 4
 
-    correlations_to_check: List[tuple] = field(default_factory=list)
+    correlations_to_check: List[tuple] = field(default_factory=lambda: [])
 
     EXPORT: bool = True
-    export_foldername: Optional[str] = None
+    export_foldername: Optional[Path] = None
     
     # --- PDM Fitting Toggles ---
     pdm_fit: bool = False
@@ -96,9 +98,13 @@ class ProcessSettings:
     sigma_bounds: List[float] = field(default_factory=lambda: [1.0, 20.0])
     gamma_bounds: List[float] = field(default_factory=lambda: [1.0, 20.0])
 
-
     def __post_init__(self):
-        # Only attempt to extract values if plotlims is populated
+        # Cast paths from loaded JSON strings
+        if isinstance(self.target_folder, str):
+            self.target_folder = Path(self.target_folder)
+        if self.export_foldername and isinstance(self.export_foldername, str):
+            self.export_foldername = Path(self.export_foldername)
+
         if self.plotlims:
             if self.fit_wmin is None:
                 self.fit_wmin = float(self.plotlims[0])
@@ -131,6 +137,47 @@ class ProcessSettings:
         return cls(**filtered_data)
 
 
+
+def print_warning(msg: str):
+    """Prints a yellow warning message to the console."""
+    print(f"\033[93m{msg}\033[0m")
+    
+    
+def correct_bounds(value, bounds, name):
+    """
+    Clips value(s) to bounds. Handles both single peak scalars 
+    and multi-peak lists/arrays.
+    """
+    
+    def _check_scalar(v, b, label):
+        low, high = b
+        if v < low:
+            print_warning(f"{label}: ({v}) is below limit. Clipping to {low}.")
+            return low
+        if v > high:
+            print_warning(f"{label}: ({v}) is above limit. Clipping to {high}.")
+            return high # Fixed bug: previously set to low
+        return v
+
+    # --- Multi-Peak Case ---
+    if isinstance(value, (list, tuple, np.ndarray)):
+        num_peaks = len(value)
+        
+        # Normalize bounds: if it's one pair [lo, hi], duplicate it for all peaks
+        if not isinstance(bounds[0], (list, tuple, np.ndarray)):
+            normalized_bounds = [bounds] * num_peaks
+        else:
+            if len(bounds) != num_peaks:
+                raise ValueError(f"Length of {name} bounds must match length of guesses.")
+            normalized_bounds = bounds
+
+        return [
+            _check_scalar(v, b, f"{name} Peak {i+1}") 
+            for i, (v, b) in enumerate(zip(value, normalized_bounds))
+        ]
+
+    # --- Single Peak Case ---
+    return _check_scalar(value, bounds, name)
 # ----------------------- Core Processing Functions -----------------------
 
 
@@ -217,9 +264,10 @@ def _process_and_plot_samples(
     complex_da, ycomp_label = _extract_target_signal(normalized_sample, "complex")
 
     # --- Plotting & Output ---
-    if config.plot_intfgm:
-        snom_utils.plot_intfgm(reference_corrected, "Reference")
-        snom_utils.plot_intfgm(sample_corrected, f"{title_label} Samples")
+    complex_df_t = None
+    if config.EXPORT or config.pdm_fit:
+        # Evaluate to Pandas once to serve both export and fitting blocks
+        complex_df_t = complex_da.T.to_pandas().dropna(how='all')
 
     if config.plot_referenced_spectra:
         fig, ax2 = plt.subplots(figsize=(7, 5))
@@ -233,7 +281,6 @@ def _process_and_plot_samples(
         )
 
         if config.EXPORT:
-            # --- Dynamically name the file so Arrays and Points don't overwrite each other ---
             safe_title = title_label.replace(" ", "_")
             save_filename = export_dir / f"{safe_title}_{config.signal_type}_spectra_output.csv"
             save_complex_filename = export_dir / f"{safe_title}_complex_spectra_output.csv"
@@ -244,10 +291,9 @@ def _process_and_plot_samples(
             print(f"Processed spectra saved to: {save_filename.name}")
             print(f"Processed spectra saved to: {save_complex_filename.name}")
             
-            df = complex_da.T.to_pandas()
-            df = df.dropna(how='all')
-            df = df.astype(str).replace({r'\(': '', r'\)': ''}, regex=True)
-            df.to_csv(save_complextranspose_filename, header=False)
+            # Format and save using the pre-calculated dataframe
+            df_formatted = complex_df_t.astype(str).replace({r'\(': '', r'\)': ''}, regex=True)
+            df_formatted.to_csv(save_complextranspose_filename, header=False)
 
         target_da.mean(dim="point").plot.line(
             x="wavenumber", hue="point", ax=ax2, add_legend=False, color="red"
@@ -258,15 +304,21 @@ def _process_and_plot_samples(
         plt.show()
 
     # --- Fitting ---
-    fit_results_df = None
+    results_bundle = {"PDM": None, "Standard": None}
 
     if config.pdm_fit:
         
-        # 1. Keep native complex numbers. Do not convert to strings.
-        df = complex_da.T.to_pandas().dropna(how='all')
+        # Handle user input errors
+        gamma_guess = correct_bounds(value=config.gamma_guess,bounds=config.gamma_bounds,name="Gamma")
+        sigma_guess = correct_bounds(value=config.sigma_guess,bounds=config.sigma_bounds,name="Sigma")
+        sigma_guess = correct_bounds(value=config.sigma_guess,bounds=config.sigma_bounds,name="Sigma")
+        A_guess = correct_bounds(value=config.A_guess,bounds=config.A_bounds,name="Amplitude")
+        slope_guess = correct_bounds(value=config.slope_guess,bounds=config.slope_bounds,name="Slope")
+        eps_guess = correct_bounds(value=config.eps_guess,bounds=config.eps_bounds,name="Epsilon")
         
         results = pfm.process_spectra_array(
-            data_input=df,
+            
+            data_input=complex_df_t, # Native complex DataFrame reused
             profile=config.pdm_profile,
             peak_centers=config.peak_centers,
             center_tolerance=config.center_tolerance,
@@ -274,27 +326,20 @@ def _process_and_plot_samples(
             baseline_regions=config.phase_fit_regions,
             
             # Explicit flat parameters
-            eps_guess=config.eps_guess,
-            slope_guess=config.slope_guess,
-            A_guess=config.A_guess,
-            sigma_guess=config.sigma_guess,
-            gamma_guess=config.gamma_guess,
-            eps_bounds=config.eps_bounds,
-            slope_bounds=config.slope_bounds,
-            A_bounds=config.A_bounds,
-            sigma_bounds=config.sigma_bounds,
-            gamma_bounds=config.gamma_bounds,
-            bulk_sample=config.bulk_sample
+            eps_guess=      eps_guess,
+            slope_guess=    slope_guess,
+            A_guess=        A_guess,
+            sigma_guess=    sigma_guess,
+            gamma_guess=    gamma_guess,
+            
+            eps_bounds=     config.eps_bounds,
+            slope_bounds=   config.slope_bounds,
+            A_bounds=       config.A_bounds,
+            sigma_bounds=   config.sigma_bounds,
+            gamma_bounds=   config.gamma_bounds,
+            
+            bulk_sample=    config.bulk_sample
         )
-        
-        # 4. Plot 2D maps only if the dataset is a 2D array
-        # if len(config.array_scan_dim) == 2:
-        #     pfm.plot_2d_maps(
-        #         results, 
-        #         nx=config.array_scan_dim[0], 
-        #         ny=config.array_scan_dim[1],
-        #         profile=config.pdm_profile
-        #     )
         
         if config.plot_fitresults:
             # 5. Plot the individual fits
@@ -331,7 +376,7 @@ def _process_and_plot_samples(
         pdm_fit_df = pd.DataFrame(fit_params, columns=param_labels)
         
         # 2. Calculate FWHM and Area to match the requested format
-        ordered_cols = ["point", "fit_success", "eps", "slope"]
+        ordered_cols = ["point", "fit_success","r_squared", "eps", "slope"]
         
         for i in range(1, num_peaks + 1):
             amp = pdm_fit_df[f"peak_{i}_amplitude"]
@@ -366,11 +411,15 @@ def _process_and_plot_samples(
 
         # 3. Add Metadata
         pdm_fit_df["point"] = range(results["M"])
+        pdm_fit_df["r_squared"] = results["fit_r2"]
         pdm_fit_df["fit_success"] = fit_success
         
         # Reorder DataFrame
         pdm_fit_df = pdm_fit_df[ordered_cols]
-        fit_results_df = pdm_fit_df
+        results_bundle["PDM"] = pdm_fit_df
+        
+        if config.plot_fitstatistics and config.correlations_to_check:
+            snom_utils.plot_correlations(results_bundle["PDM"], config.correlations_to_check,fitting_type = "PDM")
         
         # --- Export PDM Fit Results ---
         if config.EXPORT:
@@ -379,16 +428,10 @@ def _process_and_plot_samples(
             
             pdm_fit_df.to_csv(save_filename_pdm, index=False)
             print(f"PDM Fit results saved to: {save_filename_pdm.name}")
-        
-    
-    
-    if config.pdm_fit:
-        if config.plot_fitstatistics and config.correlations_to_check:
-            snom_utils.plot_correlations(fit_results_df, config.correlations_to_check)
     
     if config.fit_spectra:
         
-        fit_results_df = snom_utils.fit_all_spectra(
+        std_fit_df = snom_utils.fit_all_spectra(
             da=target_da,
             wmin=config.fit_wmin,
             wmax=config.fit_wmax,
@@ -399,18 +442,20 @@ def _process_and_plot_samples(
             grid_n=config.plotgrid_n if config.plot_fitresults else 0,
         )
         
-        if config.plot_fitstatistics and config.correlations_to_check:
-            snom_utils.plot_correlations(fit_results_df, config.correlations_to_check)
+        results_bundle["Standard"] = std_fit_df
         
+        if config.plot_fitstatistics and config.correlations_to_check:
+            snom_utils.plot_correlations(results_bundle["Standard"], config.correlations_to_check,fitting_type = "Standard")
+
 
         if config.EXPORT:
             safe_title = title_label.replace(" ", "_")
             save_filename_fits = export_dir / f"{safe_title}_fit_results.csv"
 
-            fit_results_df.to_csv(save_filename_fits, index=False)
+            std_fit_df.to_csv(save_filename_fits, index=False)
             print(f"Fit results saved to: {save_filename_fits.name}")
 
-    return fit_results_df
+    return results_bundle
 
 
 def process_spectra(target_folder: Path, config: ProcessSettings):
@@ -453,16 +498,13 @@ def process_spectra(target_folder: Path, config: ProcessSettings):
         axz_file = target_folder / config.array_format.format(num=config.array_num)
 
         if not axz_file.exists():
-            raise FileNotFoundError(
-                f"Execution halted: AXZ file {axz_file.name} not found."
-            )
+            raise ValueError(f"Execution halted: AXZ file {axz_file.name} not found.")
+        
         data = load_axz_as_dict(axz_file)
         
-        # --- DEFINE ARRAY EXPORT FOLDER ---
-        if config.export_foldername:
-            array_export_dir = Path(config.export_foldername) / f"Extracted_Data_Array_{config.array_num}"
-        else:
-            array_export_dir = target_folder / f"Extracted_Data_Array_{config.array_num}"
+        # Centralized Export Path Logic
+        base_export = config.export_foldername if config.export_foldername else target_folder
+        array_export_dir = base_export / f"Extracted_Data_Array_{config.array_num}"
         
         if config.EXPORT:
             snom_utils.export_axz_contents(
@@ -496,25 +538,15 @@ def process_spectra(target_folder: Path, config: ProcessSettings):
 
     # 3. Process Point Spectra Data
     if config.samp_nums:
-        
-        # Scan the directory once
         all_intfgm_files = list(target_folder.glob(f"*{config.ref_format[-15:]}"))
-        lsamp = len(all_intfgm_files)
         
-        print(f"{lsamp}")
-        print(f"*{config.ref_format[-15:]}")
-        
-        samp_files = [
-            f for f in all_intfgm_files 
-            if any(f.name.startswith(str(num)) for num in config.samp_nums)
-        ]
+        # C-speed string match resolution
+        samp_nums_tuple = tuple(str(num) for num in config.samp_nums)
+        samp_files = [f for f in all_intfgm_files if f.name.startswith(samp_nums_tuple)]
         
         if samp_files:
-            # --- DEFINE POINT SPECTRA EXPORT FOLDER ---
-            if config.export_foldername:
-                point_export_dir = Path(config.export_foldername) / "Extracted_Data_Point_Spectra"
-            else:
-                point_export_dir = target_folder / "Extracted_Data_Point_Spectra"
+            base_export = config.export_foldername if config.export_foldername else target_folder
+            point_export_dir = base_export / "Extracted_Data_Point_Spectra"
 
             sample_interfs = snom_utils.package_point_interferograms(samp_files)
             _process_and_plot_samples(
@@ -532,14 +564,14 @@ def process_spectra(target_folder: Path, config: ProcessSettings):
 
 
 def process_afm_drift(
-    axzdata: dict, target_folder: Path, config: ProcessSettings, fit_results_df=None
+    axzdata: dict, target_folder: Path, config: ProcessSettings, fit_results_bundle=None
 ):
-    """Processes AFM drift correction. Uses guard clauses to prevent deep nesting."""
+    """Processes AFM drift correction and maps spectral coordinates for all fit types."""
     if config.array_num is None:
         return
 
-    data = axzdata
-    processor = snom_utils.AFMArray(data)
+    # 1. Base AFM Processing
+    processor = snom_utils.AFMArray(axzdata)
     processor.extract_scans()
     processor.align_rows(method="median", mask_percentile=80)
     processor.flatten_scans(degree=1, method="2D", mask_percentile=80)
@@ -547,54 +579,63 @@ def process_afm_drift(
     if config.plot_afm:
         processor.plot_scans(show_corrected=False, num_stdev=5)
 
+    # 2. Drift Correction Processing
     if config.drift_correct:
         processor.calculate_and_apply_drift()
         processor.plot_and_fit_drift(poly_degree=config.drift_poly_degree)
 
         if config.plot_afm:
-            processor.plot_scans(show_corrected=config.drift_correct, num_stdev=5)
+            processor.plot_scans(show_corrected=True, num_stdev=5)
 
-    if not config.drift_correct:
+    # Guard clause to abort before mapping if prerequisites are not met
+    if not config.drift_correct or fit_results_bundle is None:
         return
 
-    if not config.relative_array_coords:
+    # 3. Spectral Alignment Calibration
+    if len(config.relative_array_coords) != 2:
         calibration_result = snom_utils.calibrate_start_point(target_folder)
     else:
         calibration_result = config.relative_array_coords
-    
-
-    print(f"Relative array coordinates: {calibration_result}")
-    
     
     if calibration_result is None:
         print("Skipping spectra alignment (calibration aborted).")
         return
 
+    print(f"Relative array coordinates: {calibration_result}")
     rel_x, rel_y = calibration_result
     processor.align_and_plot_spectra(rel_x, rel_y)
 
-    df = processor.apply_poly_drift_to_spectra(
-        fit_results_df=fit_results_df,
-        map_parameter=config.map_parameter,
-        shared_colormap=config.shared_colormap,
-        interp_resolution=config.interpolation_res,
-        grid_shape=config.array_scan_dim,
-    )
-    if config.EXPORT:
-        
-        if config.export_foldername:
-            array_export_dir = Path(config.export_foldername)
-            save_folder = (
-                Path(config.export_foldername) / "corrected_coordinates.csv"
-            )
-        else:
-            array_export_dir = target_folder / f"Extracted_Data_Array_{config.array_num}"
-            save_folder = (
-                array_export_dir / "corrected_coordinates.csv"
-            )
+    # 4. Map Coordinates for ALL DataFrames in the Bundle
+    # Type normalization ensures backward compatibility with older single-DataFrame scripts
+    if isinstance(fit_results_bundle, pd.DataFrame):
+        fit_results_bundle = {"fit": fit_results_bundle}
+
+    base_export = config.export_foldername if config.export_foldername else target_folder / f"Extracted_Data_Array_{config.array_num}"
+
+    for fit_type, df_to_map in fit_results_bundle.items():
+        if df_to_map is None:
+            continue
+
+        print(f"Applying drift correction to '{fit_type}' coordinates...")
+
+        # Apply mapping using the specific dataframe from the current loop iteration
+        df_mapped = processor.apply_poly_drift_to_spectra(
+            fit_results_df=df_to_map,
+            map_parameter=config.map_parameter,
+            shared_colormap=config.shared_colormap,
+            interp_resolution=config.interpolation_res,
+            grid_shape=config.array_scan_dim,
+            fitting_type = fit_type,
+            afmcolormap = config.afmcolormap,
+            hyperspectracmap = config.hyperspectracmap
             
-        df.to_csv(save_folder, index=False)
-        print(f"Corrected map coordinates saved to: {save_folder}")
+        )
+        
+        if config.EXPORT:
+            # Append the fit_type suffix to prevent file overwriting
+            save_path = base_export / f"corrected_coordinates_{fit_type}.csv"
+            df_mapped.to_csv(save_path, index=False)
+            print(f"Corrected '{fit_type}' map coordinates saved to: {save_path.name}")
 
 
 
@@ -647,10 +688,10 @@ def main():
         return
 
     # Execute Pipeline
-    axzdata, fit_df = process_spectra(target_folder, config)
+    axzdata, fit_bundle = process_spectra(target_folder, config)
 
     if config.plot_afm or config.drift_correct:
-        process_afm_drift(axzdata, target_folder, config, fit_results_df=fit_df)
+        process_afm_drift(axzdata, target_folder, config, fit_results_bundle=fit_bundle)
     
     try:
         get_ipython()
