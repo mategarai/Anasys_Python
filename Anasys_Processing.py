@@ -115,7 +115,7 @@ class ProcessSettings:
         """Exports the current settings to a JSON file."""
         data = dataclasses.asdict(self)
         with open(filepath, "w") as f:
-            json.dump(data, f, indent=4)
+            json.dump(data, f, indent=4, default=str)
 
     @classmethod
     def load_config(cls, filepath: Path, **kwargs):

@@ -9,6 +9,8 @@
     "ref_format": "{num}_AuRef_intfgm2D_1.txt",
     "plotlims": [],
     "phase_fit_regions": [],
+    "afmcolormap": "afmhot",
+    "hyperspectracmap": "jet",
     "plot_intfgm": false,
     "plot_allspectra": false,
     "plot_referenced_spectra": false,
