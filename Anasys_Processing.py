@@ -46,7 +46,7 @@ class ProcessSettings:
     target_signal: str = "//ZI/DEV533/DEMODS/1/X"
     ref_format: str = "{num}_AuRef_intfgm2D_1.txt"
     plotlims: List[float] = field(default_factory=lambda: [])
-    phase_fit_regions: List[tuple] = field(default_factory=lambda: [])
+    phase_fit_regions: List[tuple] = field(default_factory=lambda: [[],[]])
     afmcolormap: str = "afmhot"
     hyperspectracmap: str = "jet"
 
@@ -240,6 +240,9 @@ def _process_and_plot_samples(
         out_wmax=config.plotlims[1],
         correction_order=2,
     )
+    
+    if config.plot_intfgm:
+        snom_utils.plot_intfgm(sample_corrected,f"{title_label}")
 
     if config.plot_allspectra:
         snom_utils.plot_all_spectra(
@@ -488,6 +491,9 @@ def process_spectra(target_folder: Path, config: ProcessSettings):
         out_wmax=config.plotlims[1],
         correction_order=2,
     )
+    
+    if config.plot_intfgm:
+        snom_utils.plot_intfgm(reference_corrected,"AuRef")
 
     array_fit_df = None
     data = None
@@ -538,10 +544,12 @@ def process_spectra(target_folder: Path, config: ProcessSettings):
 
     # 3. Process Point Spectra Data
     if config.samp_nums:
+        # Searches all files that end in 'intfgm2D_*.txt to find same channel as reference amongst samples
         all_intfgm_files = list(target_folder.glob(f"*{config.ref_format[-15:]}"))
         
         # C-speed string match resolution
         samp_nums_tuple = tuple(str(num) for num in config.samp_nums)
+        # Sample name has to start with the sample numbers
         samp_files = [f for f in all_intfgm_files if f.name.startswith(samp_nums_tuple)]
         
         if samp_files:

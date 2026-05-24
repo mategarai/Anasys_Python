@@ -1130,6 +1130,10 @@ def make_single_spec(pos_z, int_z, pad_pow=2, auto_center_intfgm=True):
     valid_mask = pos_z != 0
     pos = pos_z[valid_mask]
     int_val = int_z[valid_mask]
+    
+    # remove first and last couple points that can get damaged
+    int_val = int_val[10:-10]
+    pos = pos[10:-10]
 
     # 2. Baseline subtraction and position normalization
     int_val = int_val - np.mean(int_val)
@@ -1266,7 +1270,7 @@ def plot_intfgm(intfgm, title, pad_pow=2, auto_center=True):
     for i in range(num_points):
         # 1. Extract the raw 1D arrays for this specific point
         pos_1d = intfgm.stage_position_mm.values[i, :]
-        int_1d = intfgm.values[i, :]
+        int_1d = intfgm.values[i, :]*1e6
 
         # Remove zeros (acts as a filter for unrecorded/padded data points)
         valid_mask = pos_1d != 0
@@ -1316,7 +1320,7 @@ def plot_intfgm(intfgm, title, pad_pow=2, auto_center=True):
             "point": np.arange(num_points),
             "step": np.arange(num_steps),
             # Note: Check your original units here. * 10.0 converts mm to cm?
-            "stage_position_mm": (("point", "step"), stage_position_matrix),
+            "Stage position (mm)": (("point", "step"), stage_position_matrix),
         },
         name=r"X2 Signal ($\mu$V)",
     )
@@ -1330,7 +1334,7 @@ def plot_intfgm(intfgm, title, pad_pow=2, auto_center=True):
     # 2. Force the axis to use this color gradient for the next plot
     ax.set_prop_cycle(color=gradient_colors)
     processed_interferograms.plot.line(
-        x="stage_position_mm", hue="point", ax=ax, add_legend=False, xlim=(-0.1, 0.2)
+        x="Stage position (mm)", hue="point", ax=ax, add_legend=False, xlim=(-0.1, 0.2)
     )
     ax.set_title(title + " Interferograms")
     plt.tight_layout()
