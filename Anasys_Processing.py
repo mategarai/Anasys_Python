@@ -242,7 +242,13 @@ def _process_and_plot_samples(
     )
     
     if config.plot_intfgm:
-        snom_utils.plot_intfgm(sample_corrected,f"{title_label}")
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        snom_utils.plot_intfgm(sample_corrected,f"{title_label}", ax)
+        
+        safe_title = title_label.replace(" ", "_")
+        save_fig_filename = export_dir / f"{safe_title}_samples_intfgm_plot.png"
+        fig.savefig(save_fig_filename, dpi=300, bbox_inches="tight")
+        print(f"Figure saved to: {save_fig_filename.name}")
 
     if config.plot_allspectra:
         snom_utils.plot_all_spectra(
@@ -283,6 +289,14 @@ def _process_and_plot_samples(
             alpha=0.1,
         )
 
+        target_da.mean(dim="point").plot.line(
+            x="wavenumber", hue="point", ax=ax2, add_legend=False, color="red"
+        )
+        ax2.set_title(f"{title_label} ({config.signal_type.capitalize()})")
+        ax2.set_xlabel(r"$\tilde{\nu}$ [cm$^{-1}$]")
+        ax2.set_ylabel(y_label)
+        ax2.set_xlim(config.plotlims)
+        
         if config.EXPORT:
             safe_title = title_label.replace(" ", "_")
             save_filename = export_dir / f"{safe_title}_{config.signal_type}_spectra_output.csv"
@@ -297,13 +311,13 @@ def _process_and_plot_samples(
             # Format and save using the pre-calculated dataframe
             df_formatted = complex_df_t.astype(str).replace({r'\(': '', r'\)': ''}, regex=True)
             df_formatted.to_csv(save_complextranspose_filename, header=False)
-
-        target_da.mean(dim="point").plot.line(
-            x="wavenumber", hue="point", ax=ax2, add_legend=False, color="red"
-        )
-        ax2.set_title(f"{title_label} ({config.signal_type.capitalize()})")
-        ax2.set_xlabel(r"Wavenumber [cm$^{-1}$]")
-        ax2.set_ylabel(y_label)
+            
+            # Save Figure
+            save_fig_filename = export_dir / f"{safe_title}_{config.signal_type}_plot.png"
+            fig.savefig(save_fig_filename, dpi=300, bbox_inches="tight")
+            print(f"Figure saved to: {save_fig_filename.name}")
+        
+        
         plt.show()
 
     # --- Fitting ---
@@ -493,7 +507,9 @@ def process_spectra(target_folder: Path, config: ProcessSettings):
     )
     
     if config.plot_intfgm:
-        snom_utils.plot_intfgm(reference_corrected,"AuRef")
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        snom_utils.plot_intfgm(reference_corrected,"AuRef", ax)
+        
 
     array_fit_df = None
     data = None

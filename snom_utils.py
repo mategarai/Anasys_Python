@@ -1256,7 +1256,7 @@ def batch_phase_correct(
 # ==========================================
 
 
-def plot_intfgm(intfgm, title, pad_pow=2, auto_center=True):
+def plot_intfgm(intfgm, title, ax, pad_pow=2, auto_center=True):
     """
     Loops through an xarray of interferograms, applies pre-FFT processing
     (baseline, apodization, padding, centering), builds a new xarray, and plots it.
@@ -1326,7 +1326,7 @@ def plot_intfgm(intfgm, title, pad_pow=2, auto_center=True):
     )
 
     # 8. Plot the interferograms
-    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+    # fig, ax = plt.subplots(1, 1, figsize=(6, 4))
     # 1. Generate a smooth list of colors from the 'viridis' colormap
     num_lines = processed_interferograms.sizes["point"]
     gradient_colors = plt.cm.viridis(np.linspace(0, 1, num_lines))
