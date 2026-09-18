@@ -303,7 +303,8 @@ def _process_and_plot_samples(
             save_complex_filename = export_dir / f"{safe_title}_complex_spectra_output.csv"
             save_complextranspose_filename = export_dir / f"{safe_title}_complex_transpose_spectra_output.csv"
 
-            target_da.to_pandas().to_csv(save_filename)
+            target_da.to_pandas().dropna(axis=1, how='all').to_csv(save_filename)
+            # target_da.to_pandas().to_csv(save_filename)
             complex_da.to_pandas().to_csv(save_complex_filename)
             print(f"Processed spectra saved to: {save_filename.name}")
             print(f"Processed spectra saved to: {save_complex_filename.name}")

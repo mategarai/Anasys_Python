@@ -622,6 +622,10 @@ class AFMArray:
                 global_vmax = np.nanmax(combined_vals)
 
         # Loop through each requested parameter
+        # Calculate limits once for the background scan to ensure they are always bound
+        bg_scan = self.scans[bg_scan_idx]
+        bg_vmin = np.percentile(bg_scan, 1)
+        bg_vmax = np.percentile(bg_scan, 99)
         for param in parameters_to_plot:
             fig, ax = plt.subplots(figsize=(8, 6))
             fig.suptitle(fitting_type)
@@ -632,6 +636,8 @@ class AFMArray:
                 cmap=afmcolormap,
                 origin="lower",
                 alpha=1,
+                vmin=bg_vmin,
+                vmax=bg_vmax 
             )
 
             if fit_results_df is not None and param is not None:
@@ -722,6 +728,8 @@ class AFMArray:
                             cmap=afmcolormap,
                             origin="lower",
                             alpha=1,
+                            vmin=bg_vmin,
+                            vmax=bg_vmax 
                         )
 
                         # 1. Reshape the 1D arrays into 2D matrices using explicit dimensions
