@@ -83,7 +83,6 @@ The following tables define all allowable parameters in the configuration file.
 | `eps_guess` | Float | e.g., 2.45 | Initial guess for the high-frequency background dielectric constant ($\epsilon_\infty$). |
 | `eps_bounds` | List [Float] | [min, max] | Boundary limits for the background dielectric constant. |
 | `A_guess` / `A_bounds` | Float / List | e.g., 50000.0 / [0, 1e9] | Initial guess and bounds for the physical oscillator strength ($S$). |
-| `slope_guess` / `slope_bounds` | Float / List | e.g., -0.0003 / [-0.1, 0.1] | Initial guess and bounds for the linear real-drift detrending. |
 | `gamma_guess` / `gamma_bounds` | Float / List | e.g., 8.0 / [2.0, 25.0] | Initial guess and bounds for the Lorentzian damping/width parameter. |
 | `sigma_guess` / `sigma_bounds` | Float / List | e.g., 6.0 / [2.0, 15.0] | Initial guess and bounds for the Gaussian inhomogeneous width parameter (used only if `pdm_profile` is "voigt"). |
 
@@ -94,7 +93,7 @@ The following tables define all allowable parameters in the configuration file.
 | `drift_poly_degree` | Integer | Integer | Degree of the polynomial fit applied to the tracked X/Y drift. Set to 0 to bypass polynomial fitting. |
 | `map_parameter` | List [String] | "peak_1_area", "peak_1_center", "peak_1_fwhm", "peak_1_amplitude", "eps", "slope" | Which fitted parameter(s) to overlay onto the AFM maps. Must exactly match output CSV column names. |
 | `shared_colormap` | Boolean | true, false | Locks the colormap limits across all generated spatial maps based on global minimum and maximum values. |
-| `array_scan_dim` | List [Integer] | e.g., [10, 10] | The [X, Y] dimensions of the scan grid. Used for reconstructing regular meshes during high-resolution interpolation. If empty, calculates automatically based on coordinates. |
+| `array_scan_dim` | List [Integer] | e.g., [10, 10] | The [Y, X] dimensions of the scan grid. Used for reconstructing regular meshes during high-resolution interpolation. If empty, calculates automatically based on coordinates. |
 | `interpolation_res` | Integer | e.g., 3 | The upsampling factor for the interpolated spatial heatmaps. |
 | `relative_array_coords` | List [Float] | e.g., [0.1234, 0.2892] | Calibrated relative array start point on the first AFM scan. If left empty, the user selects it manually and coordinates print in the terminal. |
 

@@ -30,6 +30,7 @@ Performance:
 import numpy as np
 import numpy.fft as fft
 from scipy.interpolate import interp1d
+from numpy.polynomial.laguerre import laggauss
 
 # =============================================================================
 # Tip / tapping parameters (unchanged)
@@ -37,10 +38,10 @@ from scipy.interpolate import interp1d
 Tip_rad  = 20        # nm
 Tip_amp  = 50 / 2    # nm
 Tip_freq = 250e3     # Hz
-sampling = 20        # samples per cycle
+SAMPLES_PER_CYCLE = 32
 
-Time  = np.arange(0, 30 / Tip_freq, (1 / Tip_freq) / sampling)
-Zdist = Tip_amp * np.cos(np.pi * Tip_freq * Time) + Tip_amp  # keep your original
+Time = np.arange(SAMPLES_PER_CYCLE) / (SAMPLES_PER_CYCLE * Tip_freq)
+Zdist = Tip_amp * np.cos(2.0*np.pi * Tip_freq * Time) + Tip_amp
 Tip_h = Tip_rad + Zdist
 
 inv_h3 = 1.0 / (Tip_h.astype(float) ** 3)
@@ -174,6 +175,54 @@ def fresnel_rp_layered_fast(eps_film, d_nm, eps2, kz0, kz2, k0, theta_deg=30.0, 
     r012 = (r01 + r12 * phase) / (1.0 + r01 * r12 * phase)
     return r012
 
+# Quasi-static (near-field) layered response.
+#
+# The far-field r_p above uses the OPTICAL phase exp(2i kz d). The near field is
+# evanescent: its film phase is a real decay exp(-2qd) set by the in-plane
+# momentum q, not by the wavelength. A point dipole at height h samples q with
+# the weight q^2 exp(-2qh); substituting u = 2qh turns that into the Gauss-
+# Laguerre weight u^2 exp(-u) and makes the exponential independent of
+# wavenumber, so the whole q-integral is one cached (Nh, Nq) array.
+_NQ = 12
+_u_q, _w_q = laggauss(_NQ)
+_wq2 = _w_q * _u_q**2
+_wq2 /= _wq2.sum()          # a q-independent beta then passes through unchanged
+
+_beta_E_cache = {}
+
+def _beta_E(d_nm):
+    """exp(-2qd) on the quadrature grid. Depends only on d and the tapping
+    heights, so it is constant for an entire fit."""
+    key = float(d_nm)
+    E = _beta_E_cache.get(key)
+    if E is None:
+        E = np.exp(-_u_q[None, None, :] * (key / Tip_h[None, :, None]))
+        _beta_E_cache.clear()           # only one thickness is ever in play
+        _beta_E_cache[key] = E
+    return E
+
+
+def beta_layered_qs(eps_film, eps_sub, d_nm, eps0=1.0):
+    """
+    Momentum-integrated quasi-static near-field response of a film on a substrate.
+
+        beta_eff(h) = 4h^3 Int_0^inf beta(q) q^2 exp(-2qh) dq
+        beta(q)     = (r01 + r12 e^{-2qd}) / (1 + r01 r12 e^{-2qd})
+        r01 = (eps1-eps0)/(eps1+eps0),  r12 = (eps2-eps1)/(eps2+eps1)
+
+    Exact limits: d -> inf gives the bulk film's beta, d -> 0 the substrate's.
+    Returns (Nx, Nh) - beta now varies over the tapping cycle.
+    """
+    e1 = np.asarray(eps_film, dtype=np.complex128)[:, None, None]
+    e2 = np.asarray(eps_sub, dtype=np.complex128)[:, None, None]
+    r01 = (e1 - eps0) / (e1 + eps0)
+    r12 = (e2 - e1) / (e2 + e1)
+    E = _beta_E(d_nm)
+    num = r12 * E; num += r01                  # in-place: avoids big temporaries
+    den = (r01 * r12) * E; den += 1.0
+    num /= den
+    return np.einsum('ijk,k->ij', num, _wq2)
+
 
 def fresnel_rp_layered(eps_film, d_nm, eps_sub, x_cm, theta_deg=30.0, eps0=1.0):
     """
@@ -221,8 +270,15 @@ def fresnel_rp_layered(eps_film, d_nm, eps_sub, x_cm, theta_deg=30.0, eps0=1.0):
 phase_2H = np.exp(-2j * np.pi * FFT_freq[idx_2H] * Time)
 
 def LockIn_complex(Beta, rp, alpha_0, E_inc=1.0):
+    """Beta may be (Nx,) for a half-space or (Nx, Nh) when it varies over the
+    tapping cycle, as it does for a layered sample."""
     pref = (alpha_0 * (1.0 + rp)**2 * E_inc)[:, None]
-    denom = 1.0 - (alpha_0 * Beta)[:, None] * inv_h3_scaled[None, :]
+    Beta = np.asarray(Beta)
+    if Beta.ndim == 1:
+        aB = (alpha_0 * Beta)[:, None]        # (Nx, 1) -> broadcasts over h
+    else:
+        aB = alpha_0[:, None] * Beta          # (Nx, Nh)
+    denom = 1.0 - aB * inv_h3_scaled[None, :]
     return np.dot(pref / denom, phase_2H)
 
 # =============================================================================
@@ -288,7 +344,7 @@ _PROFILE_PARAM_COUNT = {
     "voigt":   4,  # (S, w0, gamma, sigma)
 }
 
-def build_eps_sample(x, eps_inf, num_osc, osc_args, profile="lorentz", N_INH=21, span=4.0):
+def build_eps_sample(x, eps_inf, num_osc, osc_args, profile, N_INH=21, span=4.0):
     x = np.asarray(x, dtype=float)
     eps = np.full_like(x, eps_inf, dtype=np.complex128)
     n = int(round(num_osc))
@@ -323,7 +379,7 @@ def build_eps_sample(x, eps_inf, num_osc, osc_args, profile="lorentz", N_INH=21,
 _pdm_cache = {'x_arr': np.array([])}
 
 def PDM(x, numOsc, eps_inf, *osc_args, profile="lorentzian",
-        d_film_nm=300.0, theta_deg=30.0, N_INH=21, span=4.0, bulk_sample=False):
+        d_film_nm , theta_deg=30.0, N_INH=21, span=4.0, bulk_sample=False):
 
     x = np.asarray(x, dtype=float)
 
@@ -367,8 +423,10 @@ def PDM(x, numOsc, eps_inf, *osc_args, profile="lorentzian",
     
     # Route to the correct Fresnel function
     if bulk_sample:
+        Beta_samp = (E_samp - 1.0) / (E_samp + 1.0)
         rp_samp = fresnel_rp_halfspace(E_samp, theta_deg=theta_deg, eps0=1.0)
     else:
+        Beta_samp = beta_layered_qs(E_samp, E_gold, d_film_nm)
         rp_samp = fresnel_rp_layered_fast(
             E_samp, d_film_nm, E_gold, kz0, kz2, k0, theta_deg=theta_deg, eps0=1.0
         )
@@ -380,8 +438,8 @@ def PDM(x, numOsc, eps_inf, *osc_args, profile="lorentzian",
 # =============================================================================
 # Fitting wrapper
 # =============================================================================
-def PDM_fitting(x, eps_inf, slope, *osc_args,
-                profile="lorentzian", d_film_nm=1.0, theta_deg=30.0, N_INH=21, span=4.0,bulk_sample=False):
+def PDM_fitting(x, *osc_args, eps_inf,
+                profile="lorentzian", d_film_nm, theta_deg=30.0, N_INH=21, span=4.0, bulk_sample=False):
     # infer numOsc from osc_args and profile
     pcount = _PROFILE_PARAM_COUNT[str(profile).lower()]
     numOsc = len(osc_args) // pcount
@@ -389,11 +447,4 @@ def PDM_fitting(x, eps_inf, slope, *osc_args,
     z = PDM(x, numOsc, eps_inf, *osc_args,
             profile=profile, d_film_nm=d_film_nm, theta_deg=theta_deg, N_INH=N_INH, span=span,bulk_sample=bulk_sample)
 
-    # Keep your minimal real-only linear baseline tweak on the real part
-    # (still OK because you detrend both model+data inside the objective)
-    if len(osc_args) > 1:
-        x0_ref = osc_args[1]  # x0 of the first oscillator
-    else:
-        x0_ref = np.mean(x)
-
-    return (z.real + abs((x - x0_ref) * slope)) + 1j * z.imag
+    return z

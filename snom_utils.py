@@ -49,6 +49,16 @@ mpl.rcParams["savefig.dpi"] = 300
 # Data Loading & I/O
 # ==========================================
 
+def _robust_zero(scans, percentile=1.0):
+    """
+    Shifts each frame so its `percentile`-th height sits at zero.
+
+    A low percentile instead of np.min makes the offset insensitive to single
+    dropout/glitch pixels, so frames stay comparable with each other. Applying
+    it more than once is a no-op, so repeated calls down the chain are harmless.
+    """
+    offsets = np.nanpercentile(scans, percentile, axis=(1, 2), keepdims=True)
+    return scans - offsets
 
 def print_warning(msg: str):
     """Prints a yellow warning message to the console."""
@@ -128,7 +138,7 @@ class AFMArray:
                     plane = C[0] * X + C[1] * Y + C[2]
                     scan_matrix = scan_matrix - plane
 
-                scan_matrix = scan_matrix - np.min(scan_matrix)
+                # scan_matrix = scan_matrix - np.min(scan_matrix)
 
                 # Store a tuple of the matrix AND its physical size
                 scan_list.append((scan_matrix, phys_size))
@@ -154,7 +164,7 @@ class AFMArray:
                         f"got {scan.shape} / {phys}."
                     )
 
-            self.scans = np.array(uniform_scans)
+            self.scans = _robust_zero(np.array(uniform_scans))
             self.physical_size = target_phys
 
             print(
@@ -309,8 +319,9 @@ class AFMArray:
 
         scans -= offsets
 
-        scan_mins = np.min(scans, axis=(1, 2), keepdims=True)
-        scans -= scan_mins
+        # scan_mins = np.min(scans, axis=(1, 2), keepdims=True)
+        # scans -= scan_mins
+        scans = _robust_zero(scans)
 
         self.scans = scans
         print(f"Successfully aligned rows using the vectorized {method} method.")
@@ -410,13 +421,15 @@ class AFMArray:
             return
 
         # 4. GLOBAL VECTORIZED MIN-SHIFT
-        scan_mins = np.min(scans, axis=(1, 2), keepdims=True)
-        scans -= scan_mins
+        # scan_mins = np.min(scans, axis=(1, 2), keepdims=True)
+        # scans -= scan_mins
+        scans = _robust_zero(scans)
 
         self.scans = scans
         print(f"Successfully applied degree {degree} '{method}' polynomial flattening.")
 
-    def plot_scans(self, show_corrected=False, num_stdev=2):
+
+    def plot_scans(self, show_corrected=False, num_stdev=None, clip_percentile=0.5, cmap="afmhot"):
         """
         Plots all AFM scans from the array in a square grid with a shared color scale.
 
@@ -424,9 +437,16 @@ class AFMArray:
         -----------
         show_corrected : bool
             If True, plots the drift-corrected scans instead of the raw ones.
-        num_stdev : float
-            The number of standard deviations from the mean to use for the color scale limits.
-            Values outside this range will be overexposed/clipped to the end colors.
+        clip_percentile : float
+            Default limit rule. The color scale runs from this percentile of the
+            whole stack to (100 - this percentile), so a few dropout or spike
+            pixels cannot stretch the scale. 0.5 clips the darkest and brightest
+            0.5% of pixels.
+        num_stdev : float or None
+            Legacy limit rule. If given, the color scale is mean +/- num_stdev
+            standard deviations instead, and clip_percentile is ignored. Note
+            that single glitch pixels inflate the standard deviation, so this
+            usually gives a washed-out scale.
         """
 
         data_to_plot = self.corrected_scans if show_corrected else self.scans
@@ -437,19 +457,21 @@ class AFMArray:
 
         num_plots = len(data_to_plot)
 
-        # --- Calculate limits using Mean and Standard Deviation ---
-        mean_val = np.mean(data_to_plot)
-        std_val = np.std(data_to_plot)
-
-        global_vmin = mean_val - (num_stdev * std_val)
-        global_vmax = mean_val + (num_stdev * std_val)
+        # --- CHANGED: percentile limits by default, std-dev only on request ---
+        if num_stdev is not None:
+            mean_val = np.nanmean(data_to_plot)
+            std_val = np.nanstd(data_to_plot)
+            global_vmin = mean_val - (num_stdev * std_val)
+            global_vmax = mean_val + (num_stdev * std_val)
+        else:
+            global_vmin = np.nanpercentile(data_to_plot, clip_percentile)
+            global_vmax = np.nanpercentile(data_to_plot, 100.0 - clip_percentile)
 
         # Calculate grid dimensions to be as close to a square as possible
         cols = math.ceil(math.sqrt(num_plots))
         rows = math.ceil(num_plots / cols)
 
         # Create the figure with dynamically scaled sizing
-        # Add constrained_layout=True to the subplots call
         fig, axes = plt.subplots(
             rows, cols, figsize=(3 * cols, 3 * rows), constrained_layout=True
         )
@@ -480,10 +502,9 @@ class AFMArray:
 
         for idx, ax in enumerate(axes_flat):
             if idx < num_plots:
-                # Plot the actual data using the stdev-based vmin and vmax
                 im = ax.imshow(
                     data_to_plot[idx],
-                    cmap="afmhot",
+                    cmap=cmap,
                     origin="lower",
                     vmin=global_vmin,
                     vmax=global_vmax,
@@ -493,16 +514,17 @@ class AFMArray:
                 ax.set_xlabel(xaxis_label)
                 ax.set_ylabel(yaxis_label)
             else:
-                # Turn off the axes for any empty spots in the grid
                 ax.axis("off")
 
         # Add a single global colorbar for the entire figure
         if im is not None:
-            cbar = fig.colorbar(im, ax=axes_flat.tolist(), fraction=0.02, pad=0.04)
+            # CHANGED: list() not .tolist() - axes_flat is a plain list when
+            # num_plots == 1, and lists have no .tolist()
+            cbar = fig.colorbar(im, ax=list(axes_flat), fraction=0.02, pad=0.04)
             cbar.set_label("Height (nm)")
 
         plt.show()
-
+        
     def align_and_plot_spectra(self, rel_x, rel_y):
         """
         Uses the calibrated relative start point to calculate the shift
@@ -694,7 +716,7 @@ class AFMArray:
                     
                     if valid_mask.any():
                         # Determine grid dimensions
-                        if grid_shape is not None:
+                        if grid_shape:
                             rows, cols = grid_shape
                             if rows * cols != len(x_coords):
                                 print_warning(f"Warning: grid_shape {grid_shape} does not match {len(x_coords)} points. Using scatter plot only.")
@@ -854,7 +876,7 @@ def calibrate_start_point(target_folder):
     print(" 3. Click the exact location of the FIRST spectrum point.")
 
     # timeout=0 means it waits indefinitely
-    clicks = plt.ginput(3, timeout=0)
+    clicks = plt.ginput(3, timeout=0, mouse_stop=None, mouse_pop=None)
     plt.close(fig)
 
     if len(clicks) < 3:
@@ -882,13 +904,29 @@ def calibrate_start_point(target_folder):
     
     return [float(rel_x), float(rel_y)]
 
+def list_available_signals(spectrum_dict):
+    """Returns the set of DataSignal strings present in one AXZ spectrum."""
+    ig_list = spectrum_dict.get("Interferograms", {}).get("AXDSNOMInterferogram", [])
+    if isinstance(ig_list, dict):
+        ig_list = [ig_list]
+    signals = set()
+    for ig in ig_list:
+        if isinstance(ig, dict):
+            sig = ig.get("DataSignal", {}).get("Text")
+            if sig:
+                signals.add(sig)
+    return signals
 
 def extract_axz_interferogram(spectrum_dict, target_signal):
     """Finds and decodes the target interferogram from a spectrum dictionary."""
 
     ig_list = spectrum_dict.get("Interferograms", {}).get("AXDSNOMInterferogram", [])
+    if isinstance(ig_list, dict):
+        ig_list = [ig_list]
 
     for ig in ig_list:
+        if not isinstance(ig, dict):
+            continue
         if ig.get("DataSignal", {}).get("Text") == target_signal:
             try:
                 b64_data = ig["Data"]["Text"]
@@ -917,25 +955,45 @@ def extract_axz_interferogram(spectrum_dict, target_signal):
 def package_axz_interferograms(data, target_signal):
 
     spectra_list = data["Document"]["SNOMSpectra"]["AXDSNOMSpectrum"]
+    if isinstance(spectra_list, dict):      # single-spectrum files parse as a dict
+        spectra_list = [spectra_list]
+    
     all_intensities = []
     all_stage_positions = []
     expected_length = None
-
-    # 2. Extract Data
+    
     for i, spec in enumerate(spectra_list):
         stage_pos, intensity = extract_axz_interferogram(
             spec, target_signal=target_signal
         )
-
-        # Error check: ensure all arrays have the same number of points
+    
+        if intensity is None or stage_pos is None:
+            available = sorted(list_available_signals(spec))
+            if expected_length is None:
+                # Nothing has parsed yet - almost certainly a wrong target_signal.
+                raise ValueError(
+                    f"Point {i}: no interferogram matching "
+                    f"target_signal={target_signal!r}.\n"
+                    f"Signals present in this file: {available}\n"
+                    "Check the 'target_signal' entry in your config."
+                )
+            # An isolated bad point: fill with NaN rather than dropping it, so the
+            # point index stays aligned with extract_raw_spectra_coords().
+            print_warning(
+                f"Point {i}: interferogram missing or corrupt for "
+                f"{target_signal!r}; filling with NaN to keep indexing aligned."
+            )
+            intensity = np.full(expected_length, np.nan, dtype=np.float32)
+            stage_pos = all_stage_positions[-1]
+    
         if expected_length is None:
             expected_length = len(intensity)
         elif len(intensity) != expected_length:
             raise ValueError(
-                f"Shape mismatch at point {i}: "
-                f"Found {len(intensity)} points, expected {expected_length}."
+                f"Shape mismatch at point {i}: found {len(intensity)} points, "
+                f"expected {expected_length}."
             )
-
+    
         all_intensities.append(intensity)
         all_stage_positions.append(stage_pos)
 
@@ -1172,8 +1230,8 @@ def make_single_spec(pos_z, int_z, pad_pow=2, auto_center_intfgm=True):
     d = (2 * np.max(pos) / 10) * (len(int_pad) / len(int_val))
     w_n = 1 / d
 
-    # Create the wavenumber axis (1-based index equivalent to MATLAB's 1:length)
-    w_ns = np.arange(1, len(int_pad) + 1) * w_n
+    # Create the wavenumber axis
+    w_ns = np.arange(len(int_pad)) * w_n
 
     return w_ns, x_complex
 
@@ -1346,7 +1404,6 @@ def plot_intfgm(intfgm, title, ax, pad_pow=2, auto_center=True):
     )
     ax.set_title(title + " Interferograms")
     plt.tight_layout()
-    plt.show
 
 
 def plot_all_spectra(reference_spectra, sample_spectra, plotlims):
@@ -1626,6 +1683,61 @@ def fit_all_spectra(
     else:
         fwhm_bounds_list = fwhm_bounds
 
+
+        # --- Validate the fit setup once, up front ---
+    if n_peaks == 0:
+        raise ValueError("peak_centers is empty - nothing to fit.")
+
+    if center_tolerance == 0:
+        raise ValueError(
+            "center_tolerance must be > 0 "
+        )
+        
+    if len(fwhm_bounds_list) != n_peaks:
+        raise ValueError(
+            f"fwhm_bounds has {len(fwhm_bounds_list)} entries but there are "
+            f"{n_peaks} peak_centers. Give one [min, max] pair per peak, or a "
+            "single (min, max) tuple to use for all of them."
+        )
+    if len(x) < 5:
+        raise ValueError(
+            f"Only {len(x)} wavenumber points fall inside "
+            f"[{w_sorted[0]:.1f}, {w_sorted[1]:.1f}] cm^-1 - nothing to fit."
+        )
+
+    # Centre bounds and centre guesses do not depend on the pixel - build once.
+    center_bounds, center_p0, problems = [], [], []
+    for j, c in enumerate(peak_centers):
+        lo = max(w_sorted[0], c - center_tolerance)
+        hi = min(w_sorted[1], c + center_tolerance)
+        if lo >= hi:
+            problems.append(
+                f"  peak {j+1}: centre {c} +/- {center_tolerance} does not overlap "
+                f"the fit window [{w_sorted[0]:.1f}, {w_sorted[1]:.1f}]"
+            )
+            lo, hi = w_sorted[0], w_sorted[1]   # placeholder; we raise below anyway
+        f_lo, f_hi = fwhm_bounds_list[j]
+        if not f_lo < f_hi:
+            problems.append(f"  peak {j+1}: fwhm_bounds {(f_lo, f_hi)} needs min < max")
+
+        c_start = float(np.clip(c, lo, hi))
+        if c_start != c:
+            print_warning(
+                f"Peak {j+1}: centre guess {c} is outside the fit window "
+                f"[{w_sorted[0]:.1f}, {w_sorted[1]:.1f}]; starting from {c_start:.1f}."
+            )
+        center_bounds.append((lo, hi))
+        center_p0.append(c_start)
+
+    if problems:
+        raise ValueError(
+            "Cannot build valid fit bounds:\n" + "\n".join(problems) +
+            f"\nCheck peak_centers, center_tolerance and fit_wmin/fit_wmax "
+            f"(fit window is currently {w_sorted[0]:.1f} to {w_sorted[1]:.1f} cm^-1)."
+        )
+
+    fit_failures = []   # (point index, exception type, message)
+
     if do_plot:
         plots_per_fig = grid_n * grid_n
         axes_flat = None
@@ -1673,11 +1785,9 @@ def fit_all_spectra(
                     (w_sorted[1] - w_sorted[0]) / (n_peaks * 5) / w_factor, w_min, w_max
                 )
 
-                p0.extend([amp_guess, c, width_guess])
-                bounds_lower.extend([0, max(w_sorted[0], c - center_tolerance), w_min])
-                bounds_upper.extend(
-                    [np.inf, min(w_sorted[1], c + center_tolerance), w_max]
-                )
+                p0.extend([amp_guess, center_p0[j], width_guess])
+                bounds_lower.extend([0, center_bounds[j][0], w_min])
+                bounds_upper.extend([np.inf, center_bounds[j][1], w_max])
 
             p0.extend([slope_guess, baseline_guess])
             bounds_lower.extend(
@@ -1706,9 +1816,10 @@ def fit_all_spectra(
                     bounds=(bounds_lower, bounds_upper),
                 )
                 last_popt = popt
-            except RuntimeError:
+            except Exception as exc:
                 popt = None
                 last_popt = None  # Reset if failed
+                fit_failures.append((i, type(exc).__name__, str(exc)))
 
         # 1. Figure management
         if do_plot:
@@ -1787,6 +1898,15 @@ def fit_all_spectra(
         plt.show()
 
     print("\nFitting complete!")
+    
+    if fit_failures:
+        counts = Counter(kind for _, kind, _ in fit_failures)
+        print_warning(f"{len(fit_failures)}/{num_points} spectra failed to fit:")
+        for kind, n in counts.most_common():
+            print_warning(f"    {n} x {kind}")
+        first_i, first_kind, first_msg = fit_failures[0]
+        print_warning(f"    first: point {first_i} - {first_kind}: {first_msg}")
+    
     return pd.DataFrame(results)
 
 

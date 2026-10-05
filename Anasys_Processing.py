@@ -21,10 +21,16 @@ import matplotlib as mpl
 import Fitting_module as pfm
 
 try:
-    # Check if we are in Spyder / IPython
     get_ipython()
+    IN_IPYTHON = True
 except NameError:
-    mpl.use("Qt5Agg")
+    IN_IPYTHON = False
+    for _bk in ("QtAgg", "TkAgg", "MacOSX"):
+        try:
+            plt.switch_backend(_bk)
+            break
+        except Exception:
+            continue
 
 import snom_utils
 from axz_parser import load_axz_as_dict
@@ -45,6 +51,7 @@ class ProcessSettings:
     ref_nums: List[str] = field(default_factory=lambda: [])
     target_signal: str = "//ZI/DEV533/DEMODS/1/X"
     ref_format: str = "{num}_AuRef_intfgm2D_1.txt"
+    samp_format: str = "{num}_*_intfgm2D_1.txt"
     plotlims: List[float] = field(default_factory=lambda: [])
     phase_fit_regions: List[tuple] = field(default_factory=lambda: [[],[]])
     afmcolormap: str = "afmhot"
@@ -87,13 +94,11 @@ class ProcessSettings:
     
     # --- Flat PDM Parameters ---
     bulk_sample: bool = False
-    eps_guess: float = 1.0
-    slope_guess: float = 0
+    d_film_nm: float = 300.0
+    eps_inf: float = 2.5
     A_guess: float = 5.0e4
     sigma_guess: float = 10.0
     gamma_guess: float = 10.0
-    eps_bounds: List[float] = field(default_factory=lambda: [0.0,100.0])
-    slope_bounds: List[float] = field(default_factory=lambda: [-0.1,0.1])
     A_bounds: List[float] = field(default_factory=lambda: [0,1e9])
     sigma_bounds: List[float] = field(default_factory=lambda: [1.0, 20.0])
     gamma_bounds: List[float] = field(default_factory=lambda: [1.0, 20.0])
@@ -110,13 +115,31 @@ class ProcessSettings:
                 self.fit_wmin = float(self.plotlims[0])
             if self.fit_wmax is None:
                 self.fit_wmax = float(self.plotlims[1])
+                
+        if (self.fit_spectra or self.pdm_fit) and self.center_tolerance <= 0:
+            raise ValueError(
+                "center_tolerance must be > 0 when fitting is enabled. A zero "
+                "tolerance makes the lower and upper centre bounds equal, which "
+                "curve_fit rejects."
+            )
 
     def save_config(self, filepath: Path):
         """Exports the current settings to a JSON file."""
         data = dataclasses.asdict(self)
         with open(filepath, "w") as f:
             json.dump(data, f, indent=4, default=str)
-
+    
+    def export_dir(self, generated_name: str) -> Path:
+        """
+        Where outputs go.
+    
+        export_foldername set   -> that folder, used as-is.
+        export_foldername unset -> <target_folder>/<generated_name>.
+        """
+        if self.export_foldername:
+            return Path(self.export_foldername)
+        return Path(self.target_folder) / generated_name
+    
     @classmethod
     def load_config(cls, filepath: Path, **kwargs):
         """Loads settings from JSON and overrides with any provided kwargs."""
@@ -141,7 +164,19 @@ class ProcessSettings:
 def print_warning(msg: str):
     """Prints a yellow warning message to the console."""
     print(f"\033[93m{msg}\033[0m")
-    
+
+def _data_range(config):
+    """
+    Widest wavenumber span the processed data must carry.
+
+    Includes the fit window and the phase-fit regions because processing needs
+    them, and plotlims so plots are not clipped. plotlims does not affect any
+    result - only how much data is available to display and export.
+    """
+    regions = [r for r in config.phase_fit_regions if len(r) == 2]
+    lo = [config.fit_wmin, config.plotlims[0]] + [min(r) for r in regions]
+    hi = [config.fit_wmax, config.plotlims[1]] + [max(r) for r in regions]
+    return min(lo), max(hi)
     
 def correct_bounds(value, bounds, name):
     """
@@ -233,11 +268,13 @@ def _process_and_plot_samples(
     sample_spectra = snom_utils.process_all_spectra(
         sample_corrected, pad_pow=2, auto_center=True
     )
+    
+    data_lo, data_hi = _data_range(config)
     flat_sample_spectra = snom_utils.batch_phase_correct(
         sample_spectra,
         fit_regions=config.phase_fit_regions,
-        out_wmin=config.plotlims[0],
-        out_wmax=config.plotlims[1],
+        out_wmin=data_lo,
+        out_wmax=data_hi,
         correction_order=2,
     )
     
@@ -329,10 +366,7 @@ def _process_and_plot_samples(
         # Handle user input errors
         gamma_guess = correct_bounds(value=config.gamma_guess,bounds=config.gamma_bounds,name="Gamma")
         sigma_guess = correct_bounds(value=config.sigma_guess,bounds=config.sigma_bounds,name="Sigma")
-        sigma_guess = correct_bounds(value=config.sigma_guess,bounds=config.sigma_bounds,name="Sigma")
         A_guess = correct_bounds(value=config.A_guess,bounds=config.A_bounds,name="Amplitude")
-        slope_guess = correct_bounds(value=config.slope_guess,bounds=config.slope_bounds,name="Slope")
-        eps_guess = correct_bounds(value=config.eps_guess,bounds=config.eps_bounds,name="Epsilon")
         
         results = pfm.process_spectra_array(
             
@@ -340,23 +374,21 @@ def _process_and_plot_samples(
             profile=config.pdm_profile,
             peak_centers=config.peak_centers,
             center_tolerance=config.center_tolerance,
-            fit_window=config.plotlims if config.plotlims else None,
+            fit_window=[config.fit_wmin, config.fit_wmax],
             baseline_regions=config.phase_fit_regions,
             
             # Explicit flat parameters
-            eps_guess=      eps_guess,
-            slope_guess=    slope_guess,
+            eps_inf=        config.eps_inf,
             A_guess=        A_guess,
             sigma_guess=    sigma_guess,
             gamma_guess=    gamma_guess,
             
-            eps_bounds=     config.eps_bounds,
-            slope_bounds=   config.slope_bounds,
             A_bounds=       config.A_bounds,
             sigma_bounds=   config.sigma_bounds,
             gamma_bounds=   config.gamma_bounds,
             
-            bulk_sample=    config.bulk_sample
+            bulk_sample=    config.bulk_sample,
+            d_film_nm=      config.d_film_nm
         )
         
         if config.plot_fitresults:
@@ -368,7 +400,9 @@ def _process_and_plot_samples(
                 plot_every=config.pdm_plot_every, 
                 show_individual_peaks=True,
                 grid_n=config.plotgrid_n,
-                bulk_sample=config.bulk_sample
+                bulk_sample=config.bulk_sample,
+                d_film_nm=config.d_film_nm,
+                eps_inf=config.eps_inf
             )
         
         
@@ -377,9 +411,9 @@ def _process_and_plot_samples(
         P = fit_params.shape[1]
         
         # 1. Base labels for raw parameters
-        param_labels = ["eps", "slope"]
+        param_labels = []
         pcount = pfm.PROFILE_PARAM_COUNT[config.pdm_profile.lower()]
-        num_peaks = (P - 2) // pcount
+        num_peaks = P // pcount
 
         # Build initial raw columns
         for i in range(1, num_peaks + 1):
@@ -394,7 +428,7 @@ def _process_and_plot_samples(
         pdm_fit_df = pd.DataFrame(fit_params, columns=param_labels)
         
         # 2. Calculate FWHM and Area to match the requested format
-        ordered_cols = ["point", "fit_success","r_squared", "eps", "slope"]
+        ordered_cols = ["point", "fit_success","r_squared"]
         
         for i in range(1, num_peaks + 1):
             amp = pdm_fit_df[f"peak_{i}_amplitude"]
@@ -413,14 +447,14 @@ def _process_and_plot_samples(
             
             # Assign calculated columns
             pdm_fit_df[f"peak_{i}_fwhm"] = fwhm
-            pdm_fit_df[f"peak_{i}_area"] = amp * fwhm  
+            pdm_fit_df[f"peak_{i}_delta_eps"] = amp / pdm_fit_df[f"peak_{i}_center"]**2
             
             # Append to the ordered list
             ordered_cols.extend([
                 f"peak_{i}_center", 
                 f"peak_{i}_amplitude", 
                 f"peak_{i}_fwhm",
-                f"peak_{i}_area"
+                f"peak_{i}_delta_eps"
             ])
             
             # Keep Voigt-specific raw parameters if needed
@@ -431,6 +465,7 @@ def _process_and_plot_samples(
         pdm_fit_df["point"] = range(results["M"])
         pdm_fit_df["r_squared"] = results["fit_r2"]
         pdm_fit_df["fit_success"] = fit_success
+        pdm_fit_df["eps_inf"] = config.eps_inf
         
         # Reorder DataFrame
         pdm_fit_df = pdm_fit_df[ordered_cols]
@@ -499,11 +534,12 @@ def process_spectra(target_folder: Path, config: ProcessSettings):
     ref_spectra = snom_utils.process_all_spectra(
         reference_corrected, pad_pow=2, auto_center=True
     )
+    data_lo, data_hi = _data_range(config)
     flat_ref_spectra = snom_utils.batch_phase_correct(
         ref_spectra,
         fit_regions=config.phase_fit_regions,
-        out_wmin=config.plotlims[0],
-        out_wmax=config.plotlims[1],
+        out_wmin=data_lo,
+        out_wmax=data_hi,
         correction_order=2,
     )
     
@@ -526,8 +562,7 @@ def process_spectra(target_folder: Path, config: ProcessSettings):
         data = load_axz_as_dict(axz_file)
         
         # Centralized Export Path Logic
-        base_export = config.export_foldername if config.export_foldername else target_folder
-        array_export_dir = base_export / f"Extracted_Data_Array_{config.array_num}"
+        array_export_dir = config.export_dir(f"Extracted_Data_Array_{config.array_num}")
         
         if config.EXPORT:
             snom_utils.export_axz_contents(
@@ -561,17 +596,35 @@ def process_spectra(target_folder: Path, config: ProcessSettings):
 
     # 3. Process Point Spectra Data
     if config.samp_nums:
-        # Searches all files that end in 'intfgm2D_*.txt to find same channel as reference amongst samples
-        all_intfgm_files = list(target_folder.glob(f"*{config.ref_format[-15:]}"))
-        
-        # C-speed string match resolution
-        samp_nums_tuple = tuple(str(num) for num in config.samp_nums)
-        # Sample name has to start with the sample numbers
-        samp_files = [f for f in all_intfgm_files if f.name.startswith(samp_nums_tuple)]
-        
-        if samp_files:
-            base_export = config.export_foldername if config.export_foldername else target_folder
-            point_export_dir = base_export / "Extracted_Data_Point_Spectra"
+        # Build the list in samp_nums order, one glob per sample number.
+        # ref_files (above) are excluded so a reference sharing a number is not
+        # picked up as a sample.
+        ref_paths = {f.resolve() for f in ref_files}
+        samp_files = []
+
+        for num in config.samp_nums:
+            pattern = config.samp_format.format(num=num)
+            matches = [f for f in sorted(target_folder.glob(pattern))
+                       if f.resolve() not in ref_paths]
+
+            if not matches:
+                print_warning(f"No sample file matched '{pattern}' for samp_num '{num}'.")
+                continue
+            if len(matches) > 1:
+                print_warning(
+                    f"samp_num '{num}' matched {len(matches)} files; using all: "
+                    f"{[m.name for m in matches]}"
+                )
+            samp_files.extend(matches)
+
+        if not samp_files:
+            print_warning(
+                f"No point-spectra files found in {target_folder} for "
+                f"samp_nums={config.samp_nums} using samp_format='{config.samp_format}'."
+            )
+        else:
+            # base_export = config.export_foldername if config.export_foldername else target_folder
+            point_export_dir = config.export_dir("Extracted_Data_Point_Spectra")
 
             sample_interfs = snom_utils.package_point_interferograms(samp_files)
             _process_and_plot_samples(
@@ -602,7 +655,7 @@ def process_afm_drift(
     processor.flatten_scans(degree=1, method="2D", mask_percentile=80)
 
     if config.plot_afm:
-        processor.plot_scans(show_corrected=False, num_stdev=5)
+        processor.plot_scans(show_corrected=False, cmap=config.afmcolormap)
 
     # 2. Drift Correction Processing
     if config.drift_correct:
@@ -610,7 +663,7 @@ def process_afm_drift(
         processor.plot_and_fit_drift(poly_degree=config.drift_poly_degree)
 
         if config.plot_afm:
-            processor.plot_scans(show_corrected=True, num_stdev=5)
+            processor.plot_scans(show_corrected=True, cmap=config.afmcolormap)
 
     # Guard clause to abort before mapping if prerequisites are not met
     if not config.drift_correct or fit_results_bundle is None:
@@ -635,7 +688,9 @@ def process_afm_drift(
     if isinstance(fit_results_bundle, pd.DataFrame):
         fit_results_bundle = {"fit": fit_results_bundle}
 
-    base_export = config.export_foldername if config.export_foldername else target_folder / f"Extracted_Data_Array_{config.array_num}"
+    # base_export = config.export_foldername if config.export_foldername else target_folder / f"Extracted_Data_Array_{config.array_num}"
+    base_export = config.export_dir(f"Extracted_Data_Array_{config.array_num}")
+    base_export.mkdir(parents=True, exist_ok=True)
 
     for fit_type, df_to_map in fit_results_bundle.items():
         if df_to_map is None:
@@ -665,6 +720,8 @@ def process_afm_drift(
 
 
 def main():
+    
+    
     parser = argparse.ArgumentParser(
         description="Process s-SNOM data from a JSON config."
     )
@@ -717,11 +774,12 @@ def main():
 
     if config.plot_afm or config.drift_correct:
         process_afm_drift(axzdata, target_folder, config, fit_results_bundle=fit_bundle)
+
     
-    try:
-        get_ipython()
-    except NameError:
-        plt.show(block=True)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if not IN_IPYTHON:
+            plt.show(block=True)        # blocks; runs even if main() raised
