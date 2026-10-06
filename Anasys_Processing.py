@@ -423,7 +423,7 @@ def _process_and_plot_samples(
             elif config.pdm_profile.lower() == "lorentzian":
                 param_labels.append(f"peak_{i}_gamma")
             elif config.pdm_profile.lower() == "voigt":
-                param_labels.extend([f"peak_{i}_sigma", f"peak_{i}_gamma"])
+                param_labels.extend([f"peak_{i}_gamma", f"peak_{i}_sigma"])
         
         pdm_fit_df = pd.DataFrame(fit_params, columns=param_labels)
         

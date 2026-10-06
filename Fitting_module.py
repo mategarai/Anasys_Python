@@ -96,9 +96,9 @@ def build_fit_parameters(
             lb.append(gam_b[i][0])
             ub.append(gam_b[i][1])
         elif profile == "voigt":
-            p0.extend([sig_g[i], gam_g[i]])
-            lb.extend([sig_b[i][0], gam_b[i][0]])
-            ub.extend([sig_b[i][1], gam_b[i][1]])
+            p0.extend([gam_g[i], sig_g[i]])
+            lb.extend([gam_b[i][0], sig_b[i][0]])
+            ub.extend([gam_b[i][1], sig_b[i][1]])
 
     return tuple(p0), (tuple(lb), tuple(ub))
 
@@ -349,7 +349,7 @@ def plot_2d_maps(results, nx, ny, profile="voigt"):
         elif profile.lower() == "lorentzian":
             param_labels.append(f"Peak {i} Gamma")
         elif profile.lower() == "voigt":
-            param_labels.extend([f"Peak {i} Sigma", f"Peak {i} Gamma"])
+            param_labels.extend([f"Peak {i} Gamma", f"Peak {i} Sigma"])
     # -------------------------------
 
     base = 0
