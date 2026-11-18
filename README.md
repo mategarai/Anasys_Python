@@ -98,12 +98,12 @@ Every key is a field of `ProcessSettings` in `Anasys_Processing.py`. The config 
 ### Fit Quality, Plotting & Statistics
 | Parameter | Type | Default | Description |
 | :--: | :--: | :--: | :-- |
-| `r2_threshold` | Float, dict, null | null (template: 0.8) | Points whose fit R² is below it are left out of the referenced-spectra plot and drawn as × or left blank in the maps; failed fits never pass. The CSVs keep every point (filter with `r2_pass`). One number for every fit, or one per fit, e.g. {"PDM": 0.95, "Standard": 0.8}: the two R² are computed on different quantities and are not comparable. |
+| `r2_threshold` | Float, dict, null | null (template: 0.8) | Points whose fit R² is below it are left out of the referenced-spectra plot, drawn as × or left blank in the maps, and drawn hollow and left out of the Pearson R in the correlation plots; failed fits never pass. The CSVs keep every point (filter with `r2_pass`). One number for every fit, or one per fit, e.g. {"PDM": 0.95, "Standard": 0.8}: the two R² are computed on different quantities and are not comparable. |
 | `plot_intfgm` | Boolean | false | Interferograms after the single baseline subtraction and the apodization window, i.e. exactly what is Fourier-transformed (sample and reference). |
 | `plot_allspectra` | Boolean | false | Phase-corrected reference and sample spectra (Re, Im, amplitude, phase) before normalisation. |
 | `plot_referenced_spectra` | Boolean | false | Every normalised spectrum (`signal_type`) in grey with the mean in red; spectra failing `r2_threshold` are left out. |
 | `plot_fitresults` | Boolean | false | n×n grids of individual fits (standard and PDM) to check the optimizer. |
-| `plot_fitstatistics` | Boolean | false | The drift plot `<batch>_intfgm_pp.png` (`intfgm_pp`, `intfgm_offset` and `bg_tilt` against point number, one panel each with running medians; made even when no fit runs) and the correlation plots of `correlations_to_check`. |
+| `plot_fitstatistics` | Boolean | false | The drift plot `<batch>_intfgm_pp.png` (`intfgm_pp`, `intfgm_offset` and `bg_tilt` against point number, one panel each with running medians; made even when no fit runs) and the correlation plots of `correlations_to_check`. In the drift plot, points failing `r2_threshold` are drawn hollow but stay in the running median (the monitors do not depend on the fit); in the correlation plots they are drawn hollow grey and left out of the Pearson R. |
 | `correlations_to_check` | List [List [String]] | [] | Pairs of fit-table columns to plot against each other, e.g. [["peak_1_center", "peak_1_fwhm"], ["peak_1_amplitude", "intfgm_pp"]]. |
 | `plotgrid_n` | Integer | 4 | Size n of the n×n preview grids. |
 

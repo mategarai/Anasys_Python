@@ -2664,6 +2664,11 @@ def plot_correlations(df, pairs, fitting_type):
     pairs : list of tuples
         A list where each tuple contains the column names for the X and Y axes.
         Example: [('peak_1_center', 'peak_1_amplitude'), ('peak_1_fwhm', 'peak_2_center')]
+
+    Points that fail the R^2 filter (r2_pass False, set by r2_threshold) are
+    drawn as hollow grey markers and left out of the Pearson R; the panel title
+    says how many. A table without an r2_pass column keeps every point. Rows
+    where either column is NaN (failed fits) are not drawn.
     """
     num_plots = len(pairs)
     if num_plots == 0:
@@ -2708,27 +2713,49 @@ def plot_correlations(df, pairs, fitting_type):
             ax.text(0.5, 0.5, "No valid data to plot", ha="center", va="center")
             continue
 
-        x_data = valid_data[x_col]
-        y_data = valid_data[y_col]
-        points = valid_data["point"]
+        # 3. Points that fail the R^2 filter are shown hollow and grey, and
+        #    are not used for the correlation coefficient
+        if "r2_pass" in valid_data.columns:
+            passed = valid_data["r2_pass"].fillna(False).to_numpy(dtype=bool)
+        else:
+            passed = np.ones(len(valid_data), dtype=bool)
+        kept = valid_data[passed]
+        excluded = valid_data[~passed]
 
-        # 3. Scatter plot colored by the point index
-        scatter = ax.scatter(
-            x_data, y_data, c=points, cmap="viridis", alpha=0.8, edgecolor="k", s=40
-        )
+        if len(excluded):
+            ax.scatter(
+                excluded[x_col], excluded[y_col], s=40, facecolors="none",
+                edgecolors="0.6", linewidths=1.0, zorder=2,
+            )
 
-        # 4. Calculate correlation coefficient (R)
-        corr_coef = np.corrcoef(x_data, y_data)[0, 1]
+        # Scatter plot of the kept points, colored by the point index
+        scatter = None
+        if len(kept):
+            scatter = ax.scatter(
+                kept[x_col], kept[y_col], c=kept["point"], cmap="viridis",
+                alpha=0.8, edgecolor="k", s=40, zorder=3,
+            )
+
+        # 4. Correlation coefficient (R) of the kept points only
+        x_k = kept[x_col].to_numpy(dtype=float)
+        y_k = kept[y_col].to_numpy(dtype=float)
+        if len(kept) >= 2 and np.ptp(x_k) > 0 and np.ptp(y_k) > 0:
+            title = f"Pearson R = {np.corrcoef(x_k, y_k)[0, 1]:.2f}"
+        else:
+            title = "Pearson R = n/a"
+        if len(excluded):
+            title += f"\n{len(excluded)}/{len(valid_data)} excluded (R$^2$ filter)"
 
         # Format the titles and labels to look clean
-        ax.set_title(f"Pearson R = {corr_coef:.2f}", fontsize=11, fontweight="bold")
+        ax.set_title(title, fontsize=11, fontweight="bold")
         ax.set_xlabel(x_col.replace("_", " ").title())
         ax.set_ylabel(y_col.replace("_", " ").title())
         ax.grid(True, linestyle="--", alpha=0.5)
         ax.set_box_aspect(1)
 
-        cbar = fig.colorbar(scatter, ax=ax, shrink=0.55)
-        cbar.set_label("Spectrum Point Index")
+        if scatter is not None:
+            cbar = fig.colorbar(scatter, ax=ax, shrink=0.55)
+            cbar.set_label("Spectrum Point Index")
 
     # Hide any unused subplots if your list length doesn't perfectly fill the grid
     for j in range(num_plots, len(axes)):
