@@ -9,7 +9,7 @@ Created on Sat Feb 28 19:25:12 2026
 """
 Helper functions for data processing and analysis.
 
-This module contains utility functions for loading data, signal processing, 
+This module contains utility functions for loading data, signal processing,
 and plotting to keep main analysis scripts clean.
 """
 
@@ -39,10 +39,11 @@ from skimage.registration import phase_cross_correlation
 import gwyfile
 
 # SciPy Imports (Grouped together)
-from scipy.ndimage import shift, uniform_filter1d, zoom
+from scipy.ndimage import shift, uniform_filter1d, zoom, distance_transform_edt
 from scipy.optimize import curve_fit
 from scipy.signal import hilbert
 from scipy.special import erf
+from phase_utils import baseline_phase_poly
 
 mpl.rcParams["savefig.dpi"] = 300
 # ==========================================
@@ -64,20 +65,268 @@ def print_warning(msg: str):
     """Prints a yellow warning message to the console."""
     print(f"\033[93m{msg}\033[0m")
 
+
+def height_map_scan_angle(h_map) -> float:
+    """
+    Scan angle (degrees) of one AXZ height map: the 'ScanAngle' tag
+    (e.g. "-90 deg"), else Rotation/Yaw, else 0.
+    """
+    tags = (h_map.get("Tags") or {}).get("Tag", [])
+    if isinstance(tags, dict):
+        tags = [tags]
+    for tag in tags:
+        attrs = tag.get("Attributes", {}) if isinstance(tag, dict) else {}
+        if attrs.get("Name") == "ScanAngle":
+            text = str(attrs.get("Value", tag.get("Text", "")))
+            num = "".join(ch for ch in text.split("deg")[0] if ch in "+-.0123456789")
+            try:
+                return float(num)
+            except ValueError:
+                break
+    yaw = (h_map.get("Rotation") or {}).get("Yaw")
+    if isinstance(yaw, dict):
+        yaw = yaw.get("Text")
+    try:
+        return float(yaw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _axz_text(value):
+    """The text of an AXZ XML node (dicts carry it under 'Text')."""
+    if isinstance(value, dict):
+        if "Text" in value:
+            return value["Text"]
+        return list(value.values())[0] if value else None
+    return value
+
+
+def _axz_tags(h_map) -> dict:
+    """Name -> Value of a height map's Tags."""
+    tags = (h_map.get("Tags") or {}).get("Tag", [])
+    if isinstance(tags, dict):
+        tags = [tags]
+    out = {}
+    for tag in tags:
+        attrs = tag.get("Attributes", {}) if isinstance(tag, dict) else {}
+        if "Name" in attrs:
+            out[attrs["Name"]] = attrs.get("Value", tag.get("Text"))
+    return out
+
+
+def _axz_time(stamp):
+    """AXZ timestamp ('2026-10-14T17:11:22.1372132-06:00') -> seconds since the
+    epoch, using its UTC offset (so daylight-saving changes are handled)."""
+    import re
+    from datetime import datetime
+    try:
+        text = re.sub(r"(\.\d{6})\d+", r"\1", str(_axz_text(stamp)))
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _iso_seconds(duration):
+    """ISO-8601 duration ('PT43.333S', 'PT1M5S') -> seconds (nan if unreadable)."""
+    import re
+    m = re.fullmatch(r"P?T?(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?",
+                     str(_axz_text(duration) or "").strip())
+    if not m or not any(m.groups()):
+        return np.nan
+    h, mnt, s = (float(g) if g else 0.0 for g in m.groups())
+    return 3600 * h + 60 * mnt + s
+
+
+def repair_scan_start(z, retrace=None, max_lines=None, k=8.0, max_run=0.4):
+    """
+    Repair the start-of-scan artefact of one AFM frame.
+
+    The first scan line(s), recorded before the z feedback has settled, can end
+    in a short spike or ramp of tens to hundreds of nm. Each of the first
+    `max_lines` lines (default ~6% of the rows, at least 3) is compared with the median of the next three lines
+    (working upwards, so a bad line is never used as the reference), after
+    removing a robust straight-line trend from the difference (the slow creep
+    after the scan starts tilts and offsets whole lines; align_rows and the
+    flattening deal with that).
+
+    A pixel is flagged when it differs by more than `k` times the normal
+    line-to-line variation of its own column (measured in the rest of the
+    image, so rough regions get proportionally larger allowances), together
+    with the run of neighbouring pixels above k/3. Only runs that reach an end
+    of the line and are shorter than `max_run` of it are replaced: the
+    artefact is local and sits at the line end, while longer runs or runs in
+    the middle are more likely topography. Flagged pixels are filled from the retrace
+    where it is clean at that spot, otherwise from the neighbouring lines,
+    both brought to the line's own level.
+
+    z       : 2D frame in acquisition order (row 0 = first scan line)
+    retrace : the same frame in the other scan direction, aligned to z, or None
+    Returns (repaired, mask_of_replaced_pixels, n_filled_from_retrace).
+    """
+    z = np.array(z, dtype=float, copy=True)
+    ny, nx = z.shape
+    if max_lines is None:
+        max_lines = max(3, int(round(0.06 * ny)))
+    max_lines = min(max_lines, ny - 8)
+    mask = np.zeros_like(z, dtype=bool)
+    if max_lines <= 0:
+        return z, mask, 0
+    xs = np.arange(nx)
+
+    def detrend(d):
+        """d minus a robust straight-line fit along the line."""
+        keep = np.ones(nx, dtype=bool)
+        for _ in range(3):
+            c = np.polyfit(xs[keep], d[keep], 1)
+            res = d - np.polyval(c, xs)
+            s = 1.4826 * np.median(np.abs(res[keep] - np.median(res[keep]))) or 1e-12
+            keep = np.abs(res - np.median(res[keep])) < 3 * s
+            if keep.sum() < nx // 2:
+                break
+        return res
+
+    # Normal line-to-line variation per column, from the body of the image
+    body_rows = range(max_lines + 4, ny - 3)
+    steps = np.array([detrend(z[r] - np.median(z[r + 1:r + 4], axis=0)) for r in body_rows])
+    col_sigma = 1.4826 * np.median(np.abs(steps - np.median(steps, axis=0)), axis=0)
+    floor = 1.4826 * np.median(np.abs(steps - np.median(steps)))
+    col_sigma = np.maximum(col_sigma, floor if floor > 0 else 1e-12)
+
+    def flag(d):
+        dev = np.abs(detrend(d)) / col_sigma
+        bad = dev > k
+        if not bad.any():
+            return bad
+        weak = dev > k / 3.0
+        while True:   # grow strong pixels through adjacent weak ones
+            grown = bad | (weak & (np.r_[False, bad[:-1]] | np.r_[bad[1:], False]))
+            if (grown == bad).all():
+                break
+            bad = grown
+        # keep only short runs that reach an end of the line (where the
+        # artefact sits); runs in the middle are more likely topography
+        edges = np.flatnonzero(np.diff(np.r_[0, bad.astype(int), 0]))
+        for start, stop in zip(edges[::2], edges[1::2]):
+            near = max(3, int(0.03 * nx))
+            at_end = start <= near or stop >= nx - near
+            if stop - start > max_run * nx or not at_end:
+                bad[start:stop] = False
+        return bad
+
+    n_retrace = 0
+    for r in range(max_lines - 1, -1, -1):
+        ref = np.median(z[r + 1:r + 4], axis=0)
+        d = z[r] - ref
+        bad = flag(d)
+        if not bad.any():
+            continue
+        good = ~bad
+        # the line's own level relative to the reference, from its good pixels
+        c = np.polyfit(xs[good], d[good], 1)
+        fill = ref + np.polyval(c, xs)
+        if retrace is not None:
+            rd = retrace[r] - ref
+            clean = ~flag(rd)
+            use = bad & clean
+            ok = good & clean
+            if use.any() and ok.sum() >= nx // 4:
+                rc = np.polyfit(xs[ok], rd[ok], 1)
+                fill[use] = (retrace[r] - np.polyval(rc, xs) + np.polyval(c, xs))[use]
+                n_retrace += int(use.sum())
+        z[r, bad] = fill[bad]
+        mask[r] = bad
+    return z, mask, n_retrace
+
+
+def _match_retrace(trace, retrace, skip):
+    """
+    Bring a retrace frame into register with its trace: pick the left-right
+    orientation and the lateral (hysteresis) shift that make the rows below
+    `skip` agree best. Returns the aligned retrace, or None if it doesn't match
+    (or is just a copy of the trace).
+    """
+    if retrace is None or retrace.shape != trace.shape or np.array_equal(trace, retrace):
+        return None
+    a = trace[skip:] - np.median(trace[skip:], axis=1, keepdims=True)
+    best = (-np.inf, None)
+    for cand in (retrace, retrace[:, ::-1]):
+        b = cand[skip:] - np.median(cand[skip:], axis=1, keepdims=True)
+        for s in range(-10, 11):
+            bs = np.roll(b, s, axis=1)[:, 10:-10]
+            r = np.corrcoef(a[:, 10:-10].ravel(), bs.ravel())[0, 1]
+            if r > best[0]:
+                best = (r, np.roll(cand, s, axis=1))
+    return best[1] if best[0] > 0.5 else None
+
+
+def _xcorr_shift(fa, fb, upsample_factor):
+    try:
+        return np.asarray(phase_cross_correlation(fa, fb, upsample_factor=upsample_factor,
+                                                  normalization=None)[0], dtype=float)
+    except TypeError:   # scikit-image < 0.19 has no 'normalization'
+        return np.asarray(phase_cross_correlation(fa, fb, upsample_factor=upsample_factor)[0],
+                          dtype=float)
+
+
+def _register_pair(a, b, window, upsample_factor=10, iterations=4):
+    """
+    Shift (rows, cols) that moves frame b onto frame a, plus the quality of the
+    match: the correlation of the overlapping pixels after the shift, and the
+    overlap fraction.
+
+    Means are removed and the frames tapered, so the frame edges and any
+    common offset don't dominate. A taper on its own pulls large shifts towards
+    zero, so the estimate is refined: b is moved by the current shift and the
+    remaining offset is measured on the common overlap only, until it stops
+    changing (the last correction is then tiny, so the taper no longer biases it).
+    """
+    def overlap_corr(sh):
+        moved = shift(b, sh, order=1, mode="constant", cval=np.nan)
+        m = np.isfinite(moved)
+        if m.sum() < 50:
+            return np.nan, m.mean(), moved, m
+        return np.corrcoef(a[m], moved[m])[0, 1], m.mean(), moved, m
+
+    s = _xcorr_shift((a - np.mean(a)) * window, (b - np.mean(b)) * window, upsample_factor)
+    q, ov, moved, m = overlap_corr(s)
+    for _ in range(iterations):
+        if not np.isfinite(q):
+            break
+        fa = np.where(m, a - np.mean(a[m]), 0.0) * window
+        fb = np.where(m, moved - np.mean(moved[m]), 0.0) * window
+        ds = _xcorr_shift(fa, fb, upsample_factor)
+        if np.hypot(*ds) < 0.05 or np.hypot(*ds) > 0.25 * min(a.shape):
+            break
+        q_new, ov_new, moved_new, m_new = overlap_corr(s + ds)
+        if not (np.isfinite(q_new) and q_new >= q):   # keep only steps that improve the match
+            break
+        s, q, ov, moved, m = s + ds, q_new, ov_new, moved_new, m_new
+    return s, q, ov
+
+
 class AFMArray:
 
     def __init__(self, axz_dict):
         """Initialize with the dictionary loaded from your AXZ file."""
         self.raw_dict = axz_dict
         self.scans = None  # Will hold the 3D numpy array of images
-        self.drift_path = None  # Will hold the (Y, X) cumulative shifts
+        self.drift_path = None  # (Y, X) shift in pixels that moves each frame onto frame 0 (nan = not placed)
+        self.drift_quality = None  # best match quality of each frame with its neighbours
         self.corrected_scans = None  # Will hold the aligned images
+        self.scan_angle = 0.0  # Scan rotation (deg) of the AFM images, from the file
+        self.frame_times = None  # mid-scan time of each frame (s since the epoch)
+        self.instrument_drift = None  # the instrument's own DriftCorrection X/Y (um, stage frame)
+        self.repaired_pixels = None  # pixels fixed by repair_scan_start, per frame
 
-    def extract_scans(self, channel_index=0, flatten=True):
+    def extract_scans(self, channel_index=0, flatten=True, fix_scan_start=True):
         """
         Extracts and decodes the 2D AFM scans. Automatically detects how many
         channels are saved per scan based on the XML TimeStamp.
         Filters out scans that have pixel resolution OR physical dimension mismatches.
+
+        fix_scan_start : repair the start-of-scan artefact (spikes/ramps in the
+            first scan lines) with repair_scan_start, using the retrace of the
+            same channel to fill the gaps when the file has one.
         """
         scan_list = []
         try:
@@ -97,7 +346,37 @@ class AFMArray:
             print(f"Auto-detected {channel_stride} channels per scan.")
             filtered_maps = height_maps[channel_index::channel_stride]
 
-            for h_map in filtered_maps:
+            # Rotated scans store their images in the scan's own frame;
+            # align_and_plot_spectra uses this to rotate the array to match.
+            angles = [height_map_scan_angle(h) for h in filtered_maps]
+            self.scan_angle = angles[0] if angles else 0.0
+            if angles and max(angles) - min(angles) > 1e-6:
+                print_warning(
+                    f"Warning: scan angle changes between AFM images "
+                    f"({min(angles):g} to {max(angles):g} deg); using {self.scan_angle:g}."
+                )
+
+            # The retrace of the same channel, if the file stores one, fills the
+            # gaps left by the start-of-scan repair.
+            def _channel_id(h):
+                attrs = h.get("Attributes", {}) or {}
+                return attrs.get("DataChannel"), str(_axz_tags(h).get("TraceRetrace", ""))
+            group = height_maps[:channel_stride]
+            main_ch, main_dir = _channel_id(group[channel_index])
+            retrace_index = next(
+                (i for i, h in enumerate(group)
+                 if i != channel_index and _channel_id(h)[0] == main_ch
+                 and "retrace" in _channel_id(h)[1].lower() and "retrace" not in main_dir.lower()),
+                None,
+            )
+            repair_total, retrace_total, frames_repaired = 0, 0, 0
+
+            def _decode(h):
+                ry, rx = int(_axz_text(h["Resolution"]["Y"])), int(_axz_text(h["Resolution"]["X"]))
+                return np.frombuffer(base64.b64decode(_axz_text(h["SampleBase64"])),
+                                     dtype=np.float32).reshape((ry, rx)).astype(float)
+
+            for g, h_map in enumerate(filtered_maps):
                 # --- 1. Extract Pixel Resolution (Shape) ---
                 x_val = h_map["Resolution"]["X"]
                 y_val = h_map["Resolution"]["Y"]
@@ -123,8 +402,41 @@ class AFMArray:
 
                 decoded_bytes = base64.b64decode(b64_string)
                 scan_1d = np.frombuffer(decoded_bytes, dtype=np.float32)
-                scan_matrix = scan_1d.reshape((res_y, res_x))
+                scan_matrix = scan_1d.reshape((res_y, res_x)).astype(float)
+
+                # Start-of-scan artefact: repaired in acquisition order (row 0
+                # = first scan line), before flipping and plane fitting
+                n_fixed = 0
+                if fix_scan_start:
+                    retrace = None
+                    if retrace_index is not None:
+                        try:
+                            r_map = height_maps[g * channel_stride + retrace_index]
+                            retrace = _match_retrace(scan_matrix, _decode(r_map),
+                                                     skip=max(4, int(round(0.08 * res_y))))
+                        except (IndexError, KeyError, ValueError):
+                            retrace = None
+                    scan_matrix, fixed_mask, n_rt = repair_scan_start(scan_matrix, retrace)
+                    n_fixed = int(fixed_mask.sum())
+                    repair_total += n_fixed
+                    retrace_total += n_rt
+                    frames_repaired += n_fixed > 0
+
                 scan_matrix = np.flipud(scan_matrix)
+
+                # Mid-scan time (timestamps mark the end of the scan) and the
+                # instrument's own drift estimate, for the drift plot
+                scan_rate = _axz_tags(h_map).get("ScanRate", "")
+                try:
+                    duration = res_y / float(str(scan_rate).split()[0])
+                except (ValueError, IndexError, ZeroDivisionError):
+                    duration = 0.0
+                meta = {
+                    "time": _axz_time(h_map.get("TimeStamp")) - duration / 2,
+                    "dc": (float(_axz_text(h_map.get("DriftCorrectionX")) or 0),
+                           float(_axz_text(h_map.get("DriftCorrectionY")) or 0)),
+                    "fixed": n_fixed,
+                }
 
                 if flatten:
                     Y, X = np.indices(scan_matrix.shape)
@@ -140,8 +452,17 @@ class AFMArray:
 
                 # scan_matrix = scan_matrix - np.min(scan_matrix)
 
-                # Store a tuple of the matrix AND its physical size
-                scan_list.append((scan_matrix, phys_size))
+                # Store a tuple of the matrix, its physical size and metadata
+                scan_list.append((scan_matrix, phys_size, meta))
+
+            if fix_scan_start:
+                if repair_total:
+                    source = (f", {retrace_total} filled from the retrace" if retrace_index is not None
+                              else " (no retrace of this channel in the file; filled from neighbouring lines)")
+                    print(f"Start-of-scan repair: fixed {repair_total} pixels in "
+                          f"{frames_repaired}/{len(scan_list)} frames{source}.")
+                else:
+                    print("Start-of-scan repair: nothing to fix.")
 
             # --- 4. Enforce Uniform Shape AND Dimensions ---
             if not scan_list:
@@ -149,14 +470,15 @@ class AFMArray:
                 return None
 
             # Create a "signature" for each scan: ((res_y, res_x), (phys_x, phys_y))
-            signatures = [(scan.shape, phys) for scan, phys in scan_list]
+            signatures = [(scan.shape, phys) for scan, phys, _ in scan_list]
             most_common_signature = Counter(signatures).most_common(1)[0][0]
             target_shape, target_phys = most_common_signature
 
-            uniform_scans = []
-            for i, (scan, phys) in enumerate(scan_list):
+            uniform_scans, metas = [], []
+            for i, (scan, phys, meta) in enumerate(scan_list):
                 if scan.shape == target_shape and phys == target_phys:
                     uniform_scans.append(scan)
+                    metas.append(meta)
                 else:
                     print_warning(
                         f"Warning: Scan {i} skipped due to mismatch. "
@@ -166,6 +488,9 @@ class AFMArray:
 
             self.scans = _robust_zero(np.array(uniform_scans))
             self.physical_size = target_phys
+            self.frame_times = np.array([m["time"] for m in metas], dtype=float)
+            self.instrument_drift = np.array([m["dc"] for m in metas], dtype=float)
+            self.repaired_pixels = np.array([m["fixed"] for m in metas], dtype=int)
 
             print(
                 f"Physical scan size: {self.physical_size[0]} x {self.physical_size[1]}"
@@ -180,102 +505,220 @@ class AFMArray:
 
         return self.scans
 
-    def calculate_and_apply_drift(self):
-        """Calculates the frame-by-frame drift and aligns the images."""
+    def calculate_and_apply_drift(self, neighbours=3, min_quality=0.5, min_overlap=0.2,
+                                  upsample_factor=10, edge_lines=None):
+        """
+        Measures the drift of every frame relative to frame 0 and aligns the images.
 
-        upsample_factor = 10
+        Each frame is registered against its previous `neighbours` frames
+        (tapered, mean-removed cross-correlation, sub-pixel). Every pair gets a
+        quality: the correlation of the overlapping pixels after the shift.
+        Pairs with quality >= min_quality and overlap >= min_overlap are combined
+        in one least-squares solve for all frame positions, with outlying pairs
+        down-weighted, so one bad frame or pair cannot shift every later frame.
+        Frames with no usable pair are left out (nan) and interpolated in time.
+        `edge_lines` rows at the top and bottom (default ~6%) are left out of
+        the registration, where start-of-scan problems live.
 
+        Sets self.drift_path (frames x 2, (Y, X) pixels: the shift that moves
+        each frame onto frame 0) and self.drift_quality.
+        """
         if self.scans is None or len(self.scans) < 2:
             print("Not enough scans extracted to perform drift correction.")
             return
 
-        num_frames = len(self.scans)
-        self.corrected_scans = np.zeros_like(self.scans)
-        self.corrected_scans[0] = self.scans[0]
+        frames = np.asarray(self.scans, dtype=float)
+        n, ny, nx = frames.shape
+        e = max(2, int(round(0.06 * ny))) if edge_lines is None else int(edge_lines)
+        core = frames[:, e:ny - e, :]
+        window = np.outer(np.hanning(core.shape[1]), np.hanning(core.shape[2]))
 
-        # Store the [Y, X] drift for each frame relative to frame 0
-        self.drift_path = np.zeros((num_frames, 2))
-        cumulative_shift = np.array([0.0, 0.0])
+        pairs = []
+        for j in range(1, n):
+            for i in range(max(0, j - neighbours), j):
+                s, q, ov = _register_pair(core[i], core[j], window, upsample_factor)
+                pairs.append((i, j, s, q, ov))
+        good = [p for p in pairs if np.isfinite(p[3]) and p[3] >= min_quality and p[4] >= min_overlap]
 
-        for i in range(1, num_frames):
-            shift_vector, _, _ = phase_cross_correlation(
-                reference_image=self.scans[i - 1],
-                moving_image=self.scans[i],
-                upsample_factor=upsample_factor,
-            )
+        # Frames linked to frame 0 through usable pairs
+        linked, frontier = {0}, [0]
+        while frontier:
+            k = frontier.pop()
+            for i, j, *_ in good:
+                for a, b in ((i, j), (j, i)):
+                    if a == k and b not in linked:
+                        linked.add(b)
+                        frontier.append(b)
+        unknown = sorted(linked - {0})
+        col = {k: c for c, k in enumerate(unknown)}
+        use = [p for p in good if p[0] in linked and p[1] in linked]
 
-            cumulative_shift += shift_vector
-            self.drift_path[i] = cumulative_shift
+        path = np.full((n, 2), np.nan)
+        path[0] = 0.0
+        if unknown:
+            A = np.zeros((len(use), len(unknown)))
+            b = np.array([p[2] for p in use])
+            for row, (i, j, *_ ) in enumerate(use):
+                if j in col:
+                    A[row, col[j]] += 1.0
+                if i in col:
+                    A[row, col[i]] -= 1.0
+            w = np.array([p[3] for p in use])
+            for _ in range(5):   # iteratively reweighted: Huber, 1 px
+                sw = np.sqrt(w)[:, None]
+                sol = np.linalg.lstsq(A * sw, b * sw, rcond=None)[0]
+                resid = np.hypot(*(A @ sol - b).T)
+                w = np.array([p[3] for p in use]) * np.minimum(1.0, 1.0 / np.maximum(resid, 1e-9))
+            for k, c in col.items():
+                path[k] = sol[c]
 
-            self.corrected_scans[i] = shift(
-                input=self.scans[i], shift=cumulative_shift, mode="nearest"
-            )
+        quality = np.full(n, np.nan)
+        for i, j, s, q, ov in pairs:
+            if np.isfinite(q) and ov >= min_overlap:
+                for k in (i, j):
+                    quality[k] = q if not np.isfinite(quality[k]) else max(quality[k], q)
 
+        dropped = [k for k in range(n) if not np.isfinite(path[k, 0])]
+        if dropped:
+            print_warning(f"Warning: frames {dropped} matched no neighbour (quality < {min_quality}); "
+                          "their drift is interpolated from the other frames.")
+        self.drift_path = path
+        self.drift_quality = quality
+        self.drift_min_quality = min_quality
+
+        self.corrected_scans = np.array([
+            shift(frames[k], path[k], mode="nearest") if np.isfinite(path[k, 0]) else frames[k]
+            for k in range(n)
+        ])
+        print(f"Drift measured for {n - len(dropped)}/{n} frames: up to "
+              f"{np.nanmax(np.abs(path[:, 1])):.1f} px in x and {np.nanmax(np.abs(path[:, 0])):.1f} px in y.")
         return self.corrected_scans
 
-    def plot_and_fit_drift(self, poly_degree=2):
-        """Fits a polynomial to the X and Y drift paths, saves the fit, and plots them."""
+    def spectra_times(self):
+        """Mid-acquisition time (s since the epoch) of every spectrum, or None."""
+        try:
+            spectra = self.raw_dict["Document"]["SNOMSpectra"]["AXDSNOMSpectrum"]
+        except (KeyError, TypeError):
+            return None
+        if isinstance(spectra, dict):
+            spectra = [spectra]
+        times = []
+        for sp in spectra:
+            sweep = _iso_seconds((sp.get("InterferogramParameters") or {}).get("SweepTime"))
+            times.append(_axz_time(sp.get("TimeStamp")) + (sweep / 2 if np.isfinite(sweep) else 0.0))
+        times = np.array(times, dtype=float)
+        return times if np.isfinite(times).all() else None
 
-        if not hasattr(self, "drift_path") or self.drift_path is None:
-            print("Drift path is empty. Run calculate_and_apply_drift() first.")
-            return None, None
-
-        frames = np.arange(len(self.drift_path))
-        y_drift = self.drift_path[:, 0]
-        x_drift = self.drift_path[:, 1]  # Note: skimage returns (Y, X)
-
-        # Bypass fitting if degree is 0, setting coefficients to zero
-        if poly_degree == 0:
-            p_y_coeffs = [0.0]
-            p_x_coeffs = [0.0]
+    def drift_at(self, times=None, n_points=None):
+        """
+        Drift (Y, X pixels) at the given times, interpolated linearly between
+        the measured frames (held constant beyond the first/last frame). With
+        no usable timestamps, spectra are spread evenly over the frames.
+        """
+        ok = np.isfinite(self.drift_path[:, 0])
+        ft = self.frame_times
+        if times is not None and ft is not None and np.isfinite(ft[ok]).all() and np.all(np.diff(ft[ok]) > 0):
+            x, xp = np.asarray(times, dtype=float), ft[ok]
         else:
-            p_y_coeffs = np.polyfit(frames, y_drift, poly_degree)
-            p_x_coeffs = np.polyfit(frames, x_drift, poly_degree)
+            n = len(times) if times is not None else n_points
+            x, xp = np.linspace(0, len(self.drift_path) - 1, n), np.flatnonzero(ok).astype(float)
+        return np.column_stack([np.interp(x, xp, self.drift_path[ok, 0]),
+                                np.interp(x, xp, self.drift_path[ok, 1])])
 
-        # --- NEW: Save the poly1d objects to the class instance ---
-        self.drift_poly_y = np.poly1d(p_y_coeffs)
-        self.drift_poly_x = np.poly1d(p_x_coeffs)
+    def _instrument_drift_image(self):
+        """The instrument's DriftCorrection, rotated into the image frame and
+        expressed like drift_path (pixels of correction), for comparison."""
+        if self.instrument_drift is None or not np.any(self.instrument_drift):
+            return None
+        theta = np.deg2rad(-self.scan_angle)
+        rot = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+        dc = self.instrument_drift @ rot.T           # (x, y) um in the image frame
+        res_y, res_x = self.scans[0].shape
+        px, py = self.physical_size[0] / res_x, self.physical_size[1] / res_y
+        return np.column_stack([-dc[:, 1] / py, -dc[:, 0] / px])
 
-        # Create a high-resolution array of frames for smooth plotting
-        frames_high_res = np.linspace(0, len(self.drift_path) - 1, 500)
+    def plot_drift(self):
+        """Drift correction per frame and per spectrum, with match quality."""
+        if self.drift_path is None:
+            print("Drift path is empty. Run calculate_and_apply_drift() first.")
+            return None
 
-        # Plotting
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+        res_y, res_x = self.scans[0].shape
+        px_nm = 1000 * self.physical_size[0] / res_x
+        py_nm = 1000 * self.physical_size[1] / res_y
+        ok = np.isfinite(self.drift_path[:, 0])
+        have_t = self.frame_times is not None and np.isfinite(self.frame_times).all()
+        t0 = self.frame_times[0] if have_t else 0.0
+        tf = (self.frame_times - t0) / 60 if have_t else np.arange(len(self.drift_path), dtype=float)
+        t_spec = self.spectra_times() if have_t else None
+        blue, orange, grey = "#2a78d6", "#eb6834", "0.55"
 
-        # X Drift Plot
-        ax1.scatter(frames, x_drift, label="Measured Drift", color="blue")
-        ax1.plot(
-            frames_high_res,
-            self.drift_poly_x(frames_high_res),
-            label=f"Fit (Degree {poly_degree})",
-            color="red",
-            linestyle="--",
-        )
-        ax1.set_title("X-Axis Drift over Time")
-        ax1.set_xlabel("Frame Number")
-        ax1.set_ylabel("Shift (Pixels)")
-        ax1.legend()
-        ax1.grid(True)
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        inst = self._instrument_drift_image()
+        for ax, comp, scale, name in ((axes[0], 1, px_nm, "X"), (axes[1], 0, py_nm, "Y")):
+            ax.plot(tf[ok], self.drift_path[ok, comp] * scale, "-", color=blue, lw=1, alpha=0.6)
+            ax.scatter(tf[ok], self.drift_path[ok, comp] * scale, s=22, color=blue, zorder=3,
+                       label="measured (frames)")
+            if t_spec is not None:
+                d = self.drift_at(t_spec)
+                ax.scatter((t_spec - t0) / 60, d[:, comp] * scale, s=6, color=orange, zorder=4,
+                           label="applied to spectra")
+            if inst is not None:
+                ax.plot(tf, inst[:, comp] * scale, "--", color=grey, lw=1,
+                        label="instrument's DriftCorrection")
+            ax.set_title(f"{name} position correction")
+            ax.set_xlabel("time (min)" if have_t else "frame number")
+            ax.set_ylabel("correction (nm)")
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=8)
 
-        # Y Drift Plot
-        ax2.scatter(frames, y_drift, label="Measured Drift", color="green")
-        ax2.plot(
-            frames_high_res,
-            self.drift_poly_y(frames_high_res),
-            label=f"Fit (Degree {poly_degree})",
-            color="red",
-            linestyle="--",
-        )
-        ax2.set_title("Y-Axis Drift over Time")
-        ax2.set_xlabel("Frame Number")
-        ax2.set_ylabel("Shift (Pixels)")
-        ax2.legend()
-        ax2.grid(True)
+        ax = axes[2]
+        q = self.drift_quality
+        ax.scatter(tf[ok], q[ok], s=22, color=blue, label="placed")
+        if (~ok).any():
+            ax.scatter(tf[~ok], np.nan_to_num(q[~ok], nan=0.0), marker="x", s=40, color="magenta",
+                       label="no usable match (interpolated)")
+        ax.axhline(getattr(self, "drift_min_quality", 0.5), color=grey, ls="--", lw=1, label="minimum quality")
+        ax.set_ylim(min(0, np.nanmin(q) if np.isfinite(q).any() else 0) - 0.05, 1.05)
+        ax.set_title("Match quality (overlap correlation)")
+        ax.set_xlabel("time (min)" if have_t else "frame number")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
 
         plt.tight_layout()
         plt.show()
+        return fig
 
-        return self.drift_path, (self.drift_poly_y, self.drift_poly_x)
+    def build_mosaic(self):
+        """
+        Average of all aligned frames on a canvas large enough to hold them,
+        each frame levelled to the frames before it where they overlap.
+        Returns (mosaic, extent_um) with extent in frame-0 micrometres.
+        """
+        ok = np.flatnonzero(np.isfinite(self.drift_path[:, 0]))
+        ny, nx = self.scans[0].shape
+        d = self.drift_path[ok]
+        r0, c0 = int(np.floor(d[:, 0].min())), int(np.floor(d[:, 1].min()))
+        r1, c1 = int(np.ceil(d[:, 0].max())), int(np.ceil(d[:, 1].max()))
+        H, W = ny + r1 - r0, nx + c1 - c0
+        acc, cnt = np.zeros((H, W)), np.zeros((H, W))
+        for k in ok:
+            dy, dx = self.drift_path[k]
+            iy, ix = int(np.floor(dy)) - r0, int(np.floor(dx)) - c0
+            canvas = np.full((H, W), np.nan)
+            canvas[iy:iy + ny, ix:ix + nx] = self.scans[k]
+            canvas = shift(canvas, (dy - np.floor(dy), dx - np.floor(dx)), order=1,
+                           mode="constant", cval=np.nan)
+            valid = np.isfinite(canvas)
+            overlap = valid & (cnt > 0)
+            if overlap.sum() > 100:
+                canvas -= np.median(canvas[overlap] - acc[overlap] / cnt[overlap])
+            acc[valid] += canvas[valid]
+            cnt[valid] += 1
+        mosaic = np.where(cnt > 0, acc / np.maximum(cnt, 1), np.nan)
+        px, py = self.physical_size[0] / nx, self.physical_size[1] / ny
+        extent = [c0 * px, (c0 + W) * px, r0 * py, (r0 + H) * py]
+        return mosaic, extent
 
     def align_rows(self, method="median", mask_percentile=80):
         """
@@ -524,7 +967,7 @@ class AFMArray:
             cbar.set_label("Height (nm)")
 
         plt.show()
-        
+
     def align_and_plot_spectra(self, rel_x, rel_y):
         """
         Uses the calibrated relative start point to calculate the shift
@@ -534,24 +977,38 @@ class AFMArray:
         # 1. Convert the relative click to physical micrometers
         local_start_x = rel_x * self.physical_size[0]
         local_start_y = rel_y * self.physical_size[1]
-        
+
         # 2. Extract the absolute coordinates of all points
         absolute_coords = extract_raw_spectra_coords(self.raw_dict)
-        
+
         if len(absolute_coords) == 0:
             print("Error: Could not extract coordinates from XML.")
             return
 
-        # 3. Calculate the global offset using the FIRST point
-        offset_x = local_start_x - absolute_coords[0, 0]
-        offset_y = local_start_y - absolute_coords[0, 1]
+        angle = float(getattr(self, "scan_angle", 0.0) or 0.0)
+        if angle == 0:
+            # 3. Calculate the global offset using the FIRST point
+            offset_x = local_start_x - absolute_coords[0, 0]
+            offset_y = local_start_y - absolute_coords[0, 1]
 
-        # 4. Apply this offset to ALL points
-        self.spectra_local_coords = absolute_coords + [offset_x, offset_y]
+            # 4. Apply this offset to ALL points
+            self.spectra_local_coords = absolute_coords + [offset_x, offset_y]
+        else:
+            # 3-4. Rotated scan: the AFM images are stored in the scan's own
+            # frame, but the spectrum locations are stage coordinates. Rotate
+            # each point's offset from the first point back by the scan angle
+            # so the array lines up with the image (and the Analysis Studio
+            # screenshot), then place the first point at the calibrated spot.
+            theta = np.deg2rad(-angle)
+            rot = np.array([[np.cos(theta), -np.sin(theta)],
+                            [np.sin(theta), np.cos(theta)]])
+            offsets = (absolute_coords - absolute_coords[0]) @ rot.T
+            self.spectra_local_coords = offsets + [local_start_x, local_start_y]
+            print(f"Scan angle {angle:g} deg: array rotated by {-angle:g} deg to match the AFM image.")
 
         print(f"Aligned {len(self.spectra_local_coords)} points to local coordinates.")
 
-    def apply_poly_drift_to_spectra(
+    def apply_drift_to_spectra(
         self,
         fit_results_df=None,
         map_parameter=None,
@@ -561,22 +1018,26 @@ class AFMArray:
         grid_shape=None,
         fitting_type = None,
         afmcolormap = 'afmhot',
-        hyperspectracmap = 'jet'
+        hyperspectracmap = 'jet',
+        keep_mask = None,
     ):
         """
-        Evaluates the previously saved polynomial fit for each spectrum point
-        assuming they were taken sequentially, and plots the actual deformed
-        measurement locations onto the specified AFM scan.
+        Shifts every spectrum point by the drift at the moment it was measured
+        (interpolated between AFM frames by timestamp) and plots the corrected
+        locations onto the first AFM frame, or onto a mosaic of all aligned
+        frames when the corrected points fall outside the first frame.
         Supports map_parameter as a string or a list of strings to plot multiple maps.
         If shared_colormap=True, locks the color scale across all generated plots.
+
+        keep_mask : bool array (one entry per point) or None
+            Points where keep_mask is False (fit R^2 below threshold) are not
+            coloured: they are drawn as an x in the scatter map, left blank in
+            the interpolated map, and ignored when setting the colour limits.
+            None keeps every point.
         """
 
         if not hasattr(self, "drift_path") or self.drift_path is None:
             print("Error: No drift path found. Run calculate_and_apply_drift() first.")
-            return
-
-        if not hasattr(self, "drift_poly_y") or getattr(self, "drift_poly_y") is None:
-            print("Error: No polynomial fit found. Run plot_and_fit_drift() first.")
             return
 
         if (
@@ -588,14 +1049,13 @@ class AFMArray:
             )
             return
 
-        # 1. Map the spectra to the "frame timeline"
+        # 1-2. Drift at the time each spectrum was measured
         num_spectra = len(self.spectra_local_coords)
-        num_frames = len(self.drift_path)
-        spectra_timeline = np.linspace(0, num_frames - 1, num_spectra)
-
-        # 2. Evaluate the SAVED continuous polynomial drift for each point
-        dy_pix = self.drift_poly_y(spectra_timeline)
-        dx_pix = self.drift_poly_x(spectra_timeline)
+        times = self.spectra_times()
+        if times is not None and len(times) != num_spectra:
+            times = None
+        drift = self.drift_at(times, n_points=num_spectra)
+        dy_pix, dx_pix = drift[:, 0], drift[:, 1]
 
         # 3. Convert pixel drift to physical micrometers
         res_y, res_x = self.scans[bg_scan_idx].shape
@@ -610,14 +1070,45 @@ class AFMArray:
         self.corrected_spectra_coords[:, 0] = self.spectra_local_coords[:, 0] + dx_um
         self.corrected_spectra_coords[:, 1] = self.spectra_local_coords[:, 1] + dy_um
 
-        print(f"Applied stored polynomial drift to {num_spectra} points.")
+        how = "by timestamp" if times is not None else "evenly in time (no timestamps)"
+        print(f"Applied drift to {num_spectra} points, interpolated {how} between "
+              f"{int(np.isfinite(self.drift_path[:, 0]).sum())} AFM frames.")
 
         # Ensure we are working with 1D numpy arrays for plotting
         x_coords = self.corrected_spectra_coords[:, 0]
         y_coords = self.corrected_spectra_coords[:, 1]
 
-        # Define the physical extent for all plots to force true aspect ratio
-        extent = [0, self.physical_size[0], 0, self.physical_size[1]]
+        # Normalise the R^2 keep mask (True = colour this point)
+        if keep_mask is None:
+            keep_mask = np.ones(num_spectra, dtype=bool)
+        else:
+            keep_mask = np.asarray(keep_mask, dtype=bool)
+            if keep_mask.shape != (num_spectra,):
+                print_warning(
+                    f"Warning: keep_mask has {keep_mask.size} entries but there are "
+                    f"{num_spectra} points; R^2 filtering is not applied to this map."
+                )
+                keep_mask = np.ones(num_spectra, dtype=bool)
+
+        # Background: the first AFM frame, or a mosaic of all aligned frames
+        # when drift has carried some points outside the first frame
+        from matplotlib.patches import Rectangle
+        sx, sy = self.physical_size
+        outside = (x_coords < 0) | (x_coords > sx) | (y_coords < 0) | (y_coords > sy)
+        use_mosaic = bool(outside.any())
+        if use_mosaic:
+            if getattr(self, "_mosaic", None) is None:
+                self._mosaic = self.build_mosaic()
+            background, extent = self._mosaic
+            print(f"{int(outside.sum())} points fall outside the first AFM frame: "
+                  "using a mosaic of all aligned frames as background.")
+        else:
+            background, extent = self.scans[bg_scan_idx], [0, sx, 0, sy]
+
+        def _frame0_outline(axis):
+            if use_mosaic:
+                axis.add_patch(Rectangle((0, 0), sx, sy, fill=False, ls="--", ec="white",
+                                         lw=1, zorder=4, label="first AFM frame"))
 
         # Standardize map_parameter into a list
         if isinstance(map_parameter, str):
@@ -635,62 +1126,74 @@ class AFMArray:
             all_valid_vals = []
             for param in parameters_to_plot:
                 if param is not None and param in fit_results_df.columns:
-                    all_valid_vals.append(fit_results_df[param].values)
+                    # Only points that pass the R^2 filter set the scale
+                    vals = fit_results_df[param].to_numpy(dtype=float)
+                    all_valid_vals.append(vals[keep_mask & np.isfinite(vals)])
 
             if all_valid_vals:
                 combined_vals = np.concatenate(all_valid_vals)
-                # Find the absolute min and max, ignoring any NaNs (failed fits)
-                global_vmin = np.nanmin(combined_vals)
-                global_vmax = np.nanmax(combined_vals)
+                if combined_vals.size:
+                    global_vmin = np.min(combined_vals)
+                    global_vmax = np.max(combined_vals)
 
         # Loop through each requested parameter
         # Calculate limits once for the background scan to ensure they are always bound
-        bg_scan = self.scans[bg_scan_idx]
-        bg_vmin = np.percentile(bg_scan, 1)
-        bg_vmax = np.percentile(bg_scan, 99)
+        bg_vmin = np.nanpercentile(background, 1)
+        bg_vmax = np.nanpercentile(background, 99)
         for param in parameters_to_plot:
             fig, ax = plt.subplots(figsize=(8, 6))
             fig.suptitle(fitting_type)
             ax.imshow(
-                self.scans[bg_scan_idx],
+                background,
                 extent=extent,
                 aspect="equal",
                 cmap=afmcolormap,
                 origin="lower",
                 alpha=1,
                 vmin=bg_vmin,
-                vmax=bg_vmax 
+                vmax=bg_vmax
             )
+            _frame0_outline(ax)
 
             if fit_results_df is not None and param is not None:
                 if param in fit_results_df.columns:
-                    colors = fit_results_df[param].values
+                    colors = fit_results_df[param].to_numpy(dtype=float)
 
-                    valid_mask = ~np.isnan(colors)
-                    invalid_mask = np.isnan(colors)
+                    finite = np.isfinite(colors)
+                    valid_mask = finite & keep_mask       # coloured
+                    invalid_mask = ~finite                # fit failed
+                    lowr2_mask = finite & ~keep_mask      # fit ran, R^2 too low
 
                     # Determine limits for THIS specific plot
                     if shared_colormap and global_vmin is not None:
                         c_min, c_max = global_vmin, global_vmax
+                    elif valid_mask.any():
+                        c_min, c_max = np.min(colors[valid_mask]), np.max(colors[valid_mask])
                     else:
-                        c_min, c_max = np.nanmin(colors), np.nanmax(colors)
+                        c_min, c_max = None, None
 
-                    # Add vmin and vmax to lock the scale
-                    scatter = ax.scatter(
-                        x_coords[valid_mask],
-                        y_coords[valid_mask],
-                        c=colors[valid_mask],
-                        cmap=hyperspectracmap,
-                        vmin=c_min,
-                        vmax=c_max,
-                        s=150,
-                        edgecolor="k",
-                        linewidth=0.5,
-                        zorder=5,
-                    )
+                    if valid_mask.any():
+                        # Add vmin and vmax to lock the scale
+                        scatter = ax.scatter(
+                            x_coords[valid_mask],
+                            y_coords[valid_mask],
+                            c=colors[valid_mask],
+                            cmap=hyperspectracmap,
+                            vmin=c_min,
+                            vmax=c_max,
+                            s=150,
+                            edgecolor="k",
+                            linewidth=0.5,
+                            zorder=5,
+                        )
 
-                    cbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
-                    cbar.set_label(param.replace("_", " ").title(), fontsize=12)
+                        cbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
+                        cbar.set_label(param.replace("_", " ").title(), fontsize=12)
+                    else:
+                        print_warning(
+                            f"Warning: no points left to colour for '{param}' "
+                            f"({fitting_type}) after the R^2 filter."
+                        )
 
                     if invalid_mask.any():
                         ax.scatter(
@@ -702,6 +1205,20 @@ class AFMArray:
                             zorder=6,
                             label="Fit Failed",
                         )
+
+                    if lowr2_mask.any():
+                        ax.scatter(
+                            x_coords[lowr2_mask],
+                            y_coords[lowr2_mask],
+                            color="magenta",
+                            marker="x",
+                            s=60,
+                            linewidths=1.5,
+                            zorder=6,
+                            label=r"Low R$^2$ (excluded)",
+                        )
+
+                    if invalid_mask.any() or lowr2_mask.any():
                         ax.legend()
 
                     ax.set_title(
@@ -713,7 +1230,7 @@ class AFMArray:
                     # =======================================================
                     # INTERPOLATED HEATMAP FIGURE
                     # =======================================================
-                    
+
                     if valid_mask.any():
                         # Determine grid dimensions
                         if grid_shape:
@@ -726,10 +1243,10 @@ class AFMArray:
                             # Round to 2 decimal places (10 nanometers) to handle floating-point precision noise
                             unique_x = len(np.unique(np.round(self.spectra_local_coords[:, 0], decimals=2)))
                             unique_y = len(np.unique(np.round(self.spectra_local_coords[:, 1], decimals=2)))
-                            
+
                             rows = unique_y
                             cols = unique_x
-                            
+
                             # Validation fallback: if X * Y doesn't match total points (e.g., sparse or arbitrary points)
                             if rows * cols != len(x_coords):
                                 print_warning(f"Warning: Inferred grid {rows}x{cols} does not match {len(x_coords)} total points. Skipping heatmap interpolation.")
@@ -742,24 +1259,38 @@ class AFMArray:
 
                         fig2, ax2 = plt.subplots(figsize=(8, 6))
                         fig2.suptitle(fitting_type)
-                        
+
                         ax2.imshow(
-                            self.scans[bg_scan_idx],
+                            background,
                             extent=extent,
                             aspect="equal",
                             cmap=afmcolormap,
                             origin="lower",
                             alpha=1,
                             vmin=bg_vmin,
-                            vmax=bg_vmax 
+                            vmax=bg_vmax
                         )
+                        _frame0_outline(ax2)
 
                         # 1. Reshape the 1D arrays into 2D matrices using explicit dimensions
                         X_2D = x_coords.reshape((rows, cols))
                         Y_2D = y_coords.reshape((rows, cols))
-                        C_2D = colors.reshape((rows, cols))
+                        # Failed and low-R^2 points become holes in the map
+                        C_2D = np.where(valid_mask, colors, np.nan).reshape((rows, cols))
+                        hole_2D = ~np.isfinite(C_2D)
 
-                        # 2. Set upsampling factor 
+                        # A NaN passed to a cubic zoom spreads across the whole
+                        # image, so fill each hole with its nearest kept value
+                        # for the interpolation only, then mask it out again.
+                        if hole_2D.any():
+                            nearest = distance_transform_edt(
+                                hole_2D, return_distances=False, return_indices=True
+                            )
+                            C_filled = C_2D[tuple(nearest)]
+                        else:
+                            C_filled = C_2D
+
+                        # 2. Set upsampling factor
                         # Use a tuple to allow independent scaling if necessary in the future
                         zoom_factors = (interp_resolution, interp_resolution) if interp_resolution else (1, 1)
 
@@ -767,9 +1298,14 @@ class AFMArray:
                         # order=1 uses bilinear interpolation, order=3 uses cubic
                         X_highres = zoom(X_2D, zoom_factors, order=1)
                         Y_highres = zoom(Y_2D, zoom_factors, order=1)
-                        C_highres = zoom(C_2D, zoom_factors, order=3)
+                        C_highres = zoom(C_filled, zoom_factors, order=3)
+
+                        # order=0 keeps each hole a sharp block of the upsampled grid
+                        hole_highres = zoom(hole_2D.astype(np.uint8), zoom_factors, order=0).astype(bool)
+                        C_highres = np.ma.masked_array(C_highres, mask=hole_highres)
 
                         # 4. Plot the high-resolution deformed map
+                        # (masked cells are not drawn, so the AFM shows through)
                         heatmap = ax2.pcolormesh(
                             X_highres,
                             Y_highres,
@@ -901,7 +1437,7 @@ def calibrate_start_point(target_folder):
     print(
         f"First point is at {rel_x*100:.1f}% width, {rel_y*100:.1f}% height (from bottom)."
     )
-    
+
     return [float(rel_x), float(rel_y)]
 
 def list_available_signals(spectrum_dict):
@@ -957,16 +1493,16 @@ def package_axz_interferograms(data, target_signal):
     spectra_list = data["Document"]["SNOMSpectra"]["AXDSNOMSpectrum"]
     if isinstance(spectra_list, dict):      # single-spectrum files parse as a dict
         spectra_list = [spectra_list]
-    
+
     all_intensities = []
     all_stage_positions = []
     expected_length = None
-    
+
     for i, spec in enumerate(spectra_list):
         stage_pos, intensity = extract_axz_interferogram(
             spec, target_signal=target_signal
         )
-    
+
         if intensity is None or stage_pos is None:
             available = sorted(list_available_signals(spec))
             if expected_length is None:
@@ -985,7 +1521,7 @@ def package_axz_interferograms(data, target_signal):
             )
             intensity = np.full(expected_length, np.nan, dtype=np.float32)
             stage_pos = all_stage_positions[-1]
-    
+
         if expected_length is None:
             expected_length = len(intensity)
         elif len(intensity) != expected_length:
@@ -993,7 +1529,7 @@ def package_axz_interferograms(data, target_signal):
                 f"Shape mismatch at point {i}: found {len(intensity)} points, "
                 f"expected {expected_length}."
             )
-    
+
         all_intensities.append(intensity)
         all_stage_positions.append(stage_pos)
 
@@ -1088,25 +1624,18 @@ def phase_correct_spectrum(
     fit_regions,
     out_wmin=None,
     out_wmax=None,
-    correction_order=1,
+    correction_order=2,
 ):
     """
     Corrects instrumental phase twist by fitting a polynomial to specified background regions,
     and applies it over an independent output range.
+
+    The polynomial comes from phase_utils.baseline_phase_poly, the same function
+    the PDM model is flattened with (Fitting_module._flatten_phase), so data and
+    model are unwrapped and fitted identically.
     """
-    # 1. Create a mask for just the background fitting regions
-    fit_mask = np.zeros_like(wavenumbers, dtype=bool)
-    for wmin, wmax in fit_regions:
-        fit_mask |= (wavenumbers >= wmin) & (wavenumbers <= wmax)
-
-    wN_fit = wavenumbers[fit_mask]
-    spec_fit = complex_spectrum[fit_mask]
-
-    # 2. Extract and unwrap the phase for fitting
-    raw_phase = np.unwrap(np.angle(spec_fit))
-
-    # 3. Fit a polynomial to the phase twist ONLY on the background
-    p = np.polyfit(wN_fit, raw_phase, correction_order)
+    # 1-3. Unwrap per region, align the regions by 2*pi, fit ONE polynomial
+    p = baseline_phase_poly(wavenumbers, complex_spectrum, fit_regions, correction_order)
 
     # 4. Define the output range (decoupled from fit limits)
     if out_wmin is None:
@@ -1151,62 +1680,170 @@ def baseline_correct(y, deg=3, exclude_arry=None):
     return y, fit
 
 
-def apodization(pos, intfgm):
-    # 1. Baseline correct the interferogram
-    # (Assuming our baseline_correct function from earlier is defined)
-    int_corr, _ = baseline_correct(intfgm)
+# Samples dropped at each end of every sweep: the first and last few can be
+# damaged. make_single_spec, interferogram_pp/offset and instrumental_lorentz_fwhm
+# all use the same selection.
+INTFGM_TRIM = 10
 
-    # 2. Smooth the absolute value
+
+def _recorded_trimmed(pos_z, int_z, trim=INTFGM_TRIM):
+    """The samples of one sweep that are processed: recorded (stage position
+    != 0) and not within `trim` samples of either end. Returns (pos, values)."""
+    pos_z = np.asarray(pos_z, dtype=float)
+    int_z = np.asarray(int_z, dtype=float)
+    valid = pos_z != 0
+    pos, val = pos_z[valid], int_z[valid]
+    if trim:
+        pos, val = pos[trim:-trim], val[trim:-trim]
+    return pos, val
+
+
+def interferogram_baseline(y, deg=3, burst_frac=0.1):
+    """
+    The ONE baseline subtraction applied to an interferogram.
+
+    y : the processed samples of one sweep (recorded and trimmed, see
+        _recorded_trimmed).
+
+    A polynomial of `deg` in sample index, fitted on the wings only. The
+    centreburst - where the smoothed fringe envelope exceeds burst_frac of its
+    maximum - is left out of the fit, because its large fringes pull a
+    polynomial fitted through them. (Before 2026-11-17 three corrections were
+    stacked: a cubic through the whole raw sweep, the mean of the trimmed sweep,
+    and a second cubic inside apodization(), each fitted through the burst.)
+
+    The burst is located on a rough residual (y minus a polynomial through every
+    sample), so a large slow drift cannot be mistaken for fringes. If fewer than
+    4*(deg+1) wing samples remain, every sample is used.
+
+    Returns (y - baseline, baseline, coefficients). coefficients are np.polyfit
+    coefficients in the index frame of y; all three are NaN/None if y contains
+    non-finite values (a corrupt point, see package_axz_interferograms).
+    """
+    y = np.asarray(y, dtype=float)
+    if y.size == 0 or not np.all(np.isfinite(y)):
+        nan = np.full_like(y, np.nan)
+        return nan, nan, None
+    idx = np.arange(y.size, dtype=float)
+    rough = y - np.polyval(np.polyfit(idx, y, deg), idx)
+    env = uniform_filter1d(np.abs(hilbert(rough)), size=max(1, y.size // 50))
+    wings = env <= burst_frac * env.max()
+    if wings.sum() < 4 * (deg + 1):
+        wings = np.ones(y.size, dtype=bool)
+    coef = np.polyfit(idx[wings], y[wings], deg)
+    base = np.polyval(coef, idx)
+    return y - base, base, coef
+
+
+def baseline_correct_interferogram(pos_z, int_z, trim=INTFGM_TRIM, deg=3):
+    """
+    Full-length copy of one sweep with exactly the baseline make_single_spec
+    removes (same samples, same fit), extended over the trimmed end samples.
+    Unrecorded samples (stage position 0) are returned unchanged.
+
+    For interferogram_pp and display only: the spectra are computed from the
+    RAW sweeps, so the baseline is never subtracted twice.
+    """
+    pos_z = np.asarray(pos_z, dtype=float)
+    out = np.array(int_z, dtype=float, copy=True)
+    valid = np.flatnonzero(pos_z != 0)
+    keep = valid[trim:-trim] if trim else valid
+    _, _, coef = interferogram_baseline(out[keep], deg=deg)
+    if coef is None:
+        out[valid] = np.nan
+        return out
+    # index frame of interferogram_baseline: 0 at the first kept sample
+    out[valid] -= np.polyval(coef, np.arange(valid.size, dtype=float) - (trim or 0))
+    return out
+
+
+def baseline_correct_sweeps(intfgm_da, trim=INTFGM_TRIM, deg=3):
+    """baseline_correct_interferogram for every point of an interferogram
+    DataArray (dims point, step, coordinate stage_position_mm)."""
+    pos = np.atleast_2d(intfgm_da.stage_position_mm.values)
+    vals = np.atleast_2d(intfgm_da.values)
+    out = np.array([baseline_correct_interferogram(p, v, trim, deg) for p, v in zip(pos, vals)])
+    return intfgm_da.copy(data=out.reshape(intfgm_da.shape))
+
+
+def apodization(pos, intfgm, decay_frac=0.25):
+    """
+    Window for ONE interferogram whose baseline has already been removed
+    (interferogram_baseline; this function no longer subtracts one itself).
+
+    erf rising edge before the centreburst x exp(-(x - x_max)/tc) after it,
+    tc = decay_frac * mirror travel. Before the envelope maximum the exponential
+    is held at 1: it used to keep growing there, exp(+(x_max - x)/tc), so the
+    window rose above 1 on the leading side of the burst.
+    """
+    int_corr = np.asarray(intfgm, dtype=float)
+
+    # 1. Smooth the absolute value
     window_size = max(1, len(int_corr) // 50)
     envelope = uniform_filter1d(np.abs(int_corr), size=window_size)
 
-    # 3. Find indices for max and half-max
+    # 2. Find indices for max and half-max
     max_i = np.argmax(envelope)
 
     # np.argmax on a boolean array
     # by returning the index of the first True value
     half_i = np.argmax(envelope > (np.max(envelope) / 2))
 
-    # 4. Calculate standard deviation of the Gaussian pulse
+    # 3. Calculate standard deviation of the Gaussian pulse
     st_dev = np.abs(pos[max_i] - pos[half_i])
 
     # Prevent division by zero just in case
     if st_dev == 0:
         st_dev = 1e-9
 
-    # 5. Calculate CDF using the error function
+    # 4. Calculate CDF using the error function
     cdf = 0.5 * (1 + erf((pos - pos[half_i] + st_dev) / (np.sqrt(2) * st_dev)))
 
-    # 6. Calculate exponential decay
-    exp_tc = (np.max(pos) - np.min(pos)) / 4.0
-    exp_decay = np.exp(-(pos - pos[max_i]) / exp_tc)
+    # 5. Exponential decay after the envelope maximum, 1 before it
+    if decay_frac:
+        exp_tc = decay_frac * (np.max(pos) - np.min(pos))     # mm of mirror travel
+        exp_decay = np.exp(-np.clip(pos - pos[max_i], 0.0, None) / exp_tc)
+    else:
+        exp_decay = np.ones_like(pos)
 
-    # 7. Final Apodization function
+    # 6. Final Apodization function (never above 1)
     apod_function = exp_decay * cdf
 
     return int_corr * apod_function, apod_function
 
+def instrumental_lorentz_fwhm(pos_mm, decay_frac, trim=INTFGM_TRIM):
+    """
+    Lorentzian FWHM (cm^-1) that apodization()'s exponential adds to every band.
 
-def make_single_spec(pos_z, int_z, pad_pow=2, auto_center_intfgm=True):
+    exp(-x/tc) on the interferogram (x = mirror travel after ZPD, tc in mm) is a
+    convolution of the spectrum with a Lorentzian of FWHM 1/(pi*lambda_OPD),
+    lambda_OPD = 2*tc/10 cm, i.e. 5/(pi*tc_mm), with tc = decay_frac * L.
+    The point selection mirrors make_single_spec (drop zeros, trim INTFGM_TRIM each end).
+    """
+    if not decay_frac:
+        return 0.0
+    p = np.asarray(pos_mm, dtype=float)
+    p = p[p != 0][trim:-trim]
+    L = float(p.max() - p.min())          # mirror travel actually used, mm
+    return 5.0 / (np.pi * decay_frac * L)
+
+def make_single_spec(pos_z, int_z, pad_pow=2, auto_center_intfgm=True, decay_frac=0.25):
     """
     Calculates the spectrum from an interferogram.
     Returns wavenumbers (w_ns) and complex values (x_complex).
     """
-    # 1. Remove zeros (acts as a filter for unrecorded/padded data points)
-    valid_mask = pos_z != 0
-    pos = pos_z[valid_mask]
-    int_val = int_z[valid_mask]
-    
-    # remove first and last couple points that can get damaged
-    int_val = int_val[10:-10]
-    pos = pos[10:-10]
+    # 1. Recorded samples only (stage position != 0), minus INTFGM_TRIM samples
+    #    at each end, which can be damaged
+    pos, int_val = _recorded_trimmed(pos_z, int_z)
 
-    # 2. Baseline subtraction and position normalization
-    int_val = int_val - np.mean(int_val)
+    # 2. The one baseline subtraction (polynomial fitted on the wings), and
+    #    position normalization. Pass RAW sweeps: nothing upstream subtracts a
+    #    baseline any more.
+    int_val, _, _ = interferogram_baseline(int_val)
     pos = pos - np.min(pos)
 
     # 3. Calculate and apply filtering (apodization) function
-    int_filtered, _ = apodization(pos, int_val)
+    int_filtered, _ = apodization(pos, int_val, decay_frac=decay_frac)
 
     # 4. Zero-padding to the next power of 2 (optimized for FFT speed)
     target_l = int(2 ** (np.ceil(np.log2(len(int_filtered))) + pad_pow))
@@ -1227,8 +1864,8 @@ def make_single_spec(pos_z, int_z, pad_pow=2, auto_center_intfgm=True):
 
     # 7. Calculate wavenumbers
     # Assuming pos is in millimeters, dividing by 10 converts to cm for cm^-1
-    d = (2 * np.max(pos) / 10) * (len(int_pad) / len(int_val))
-    w_n = 1 / d
+    dx_mm = (pos[-1] - pos[0]) / (len(pos) - 1)               # mirror step, mm
+    w_n   = 1.0 / (len(int_pad) * 2.0 * abs(dx_mm) / 10.0)     # cm^-1 per FFT bin
 
     # Create the wavenumber axis
     w_ns = np.arange(len(int_pad)) * w_n
@@ -1236,7 +1873,7 @@ def make_single_spec(pos_z, int_z, pad_pow=2, auto_center_intfgm=True):
     return w_ns, x_complex
 
 
-def process_all_spectra(spectra_da, pad_pow=2, auto_center=True):
+def process_all_spectra(spectra_da, pad_pow=2, auto_center=True, decay_frac=0.25):
     """
     Loops through an xarray of interferograms, applies make_single_spec to each,
     and returns a new xarray containing the complex frequency spectra.
@@ -1250,7 +1887,7 @@ def process_all_spectra(spectra_da, pad_pow=2, auto_center=True):
 
     # 2. Process the FIRST point to get the wavenumber axis and output shape
     wNs, first_complex = make_single_spec(
-        pos_matrix[0], int_matrix[0], pad_pow=pad_pow, auto_center_intfgm=auto_center
+        pos_matrix[0], int_matrix[0], pad_pow=pad_pow, auto_center_intfgm=auto_center, decay_frac=decay_frac,
     )
 
     # 3. PRE-ALLOCATE the output matrix
@@ -1266,6 +1903,7 @@ def process_all_spectra(spectra_da, pad_pow=2, auto_center=True):
             int_matrix[i],
             pad_pow=pad_pow,
             auto_center_intfgm=auto_center,
+            decay_frac=decay_frac,
         )
         complex_matrix[i] = X_complex
 
@@ -1322,10 +1960,12 @@ def batch_phase_correct(
 # ==========================================
 
 
-def plot_intfgm(intfgm, title, ax, pad_pow=2, auto_center=True):
+def plot_intfgm(intfgm, title, ax, pad_pow=2, auto_center=True, decay_frac=0.25):
     """
     Loops through an xarray of interferograms, applies pre-FFT processing
     (baseline, apodization, padding, centering), builds a new xarray, and plots it.
+    Pass the RAW interferograms: the baseline is removed here, as in
+    make_single_spec.
     """
     num_points = intfgm.sizes["point"]
 
@@ -1338,13 +1978,10 @@ def plot_intfgm(intfgm, title, ax, pad_pow=2, auto_center=True):
         pos_1d = intfgm.stage_position_mm.values[i, :]
         int_1d = intfgm.values[i, :]*1e6
 
-        # Remove zeros (acts as a filter for unrecorded/padded data points)
-        valid_mask = pos_1d != 0
-        pos = pos_1d[valid_mask]
-        int_val = int_1d[valid_mask]
-
-        # 2. Baseline subtraction and position normalization
-        int_val = int_val - np.mean(int_val)
+        # Same sample selection and the same single baseline as make_single_spec
+        # (pass RAW interferograms)
+        pos, int_val = _recorded_trimmed(pos_1d, int_1d)
+        int_val, _, _ = interferogram_baseline(int_val)
         pos = pos - np.min(pos)
 
         # Extract the average step size so we can extrapolate the x-axis later
@@ -1352,7 +1989,7 @@ def plot_intfgm(intfgm, title, ax, pad_pow=2, auto_center=True):
 
         # 3. Calculate and apply filtering (apodization) function
         # (Assuming apodization is defined elsewhere in your script)
-        int_filtered, _ = apodization(pos, int_val)
+        int_filtered, _ = apodization(pos, int_val, decay_frac=decay_frac)
 
         # 4. Zero-padding to the next power of 2
         target_l = int(2 ** (np.ceil(np.log2(len(int_filtered))) + pad_pow))
@@ -1488,10 +2125,10 @@ def _generate_peak_model(n_peaks, shape, x_center):
         y_calc = np.zeros_like(x_vals)
         for i in range(n_peaks):
             a, c, w = params[i * 3 : i * 3 + 3]
-            
+
             if shape == "gaussian":
                 y_calc += a * np.exp(-((x_vals - c) ** 2) / (2 * w**2))
-                
+
             elif shape == "lorentzian":
                 y_calc += a * (w**2 / ((x_vals - c) ** 2 + w**2))
 
@@ -1502,137 +2139,33 @@ def _generate_peak_model(n_peaks, shape, x_center):
     return multi_peak_model
 
 
-def fit_spectral_region(
-    da,
-    point_index,
-    wmin,
-    wmax,
-    peak_centers,
-    shape="lorentzian",
-    center_tolerance=10.0,
-    fwhm_bounds=(2.0, 50.0),
-    plot=True,
-    ax=None,
-):
-    """Fits Gaussian or Lorentzian peaks to an xarray DataArray with a linear sloping background."""
-    spectrum = da.isel(point=point_index)
+def per_peak_tolerance(center_tolerance, n_peaks):
+    """
+    One centre tolerance (cm^-1) per peak.
 
-    w_sorted = np.sort([wmin, wmax])
-    region = spectrum.where(
-        (spectrum.wavenumber >= w_sorted[0]) & (spectrum.wavenumber <= w_sorted[1]),
-        drop=True,
-    )
+    center_tolerance can be
+      a number          5.0            -> 5.0 for every peak
+      a one-item list   [5.0]          -> 5.0 for every peak
+      a full list       [5, 3, 5, 10]  -> one value per peak, in peak_centers order
 
-    x = region.wavenumber.values
-    y = region.values
-
-    valid_mask = np.isfinite(x) & np.isfinite(y)
-    x = x[valid_mask]
-    y = y[valid_mask]
-
-    if len(x) < 5:
-        print(
-            f"Error: Not enough valid data points in this region to fit point {point_index}."
-        )
-        return None
-
-    n_peaks = len(peak_centers)
-    x_center = (w_sorted[0] + w_sorted[1]) / 2.0
-
-    # Build bounds list
-    if (
-        isinstance(fwhm_bounds, tuple)
-        and len(fwhm_bounds) == 2
-        and isinstance(fwhm_bounds[0], (int, float))
-    ):
-        fwhm_bounds_list = [fwhm_bounds] * n_peaks
-    elif isinstance(fwhm_bounds, list) and len(fwhm_bounds) == n_peaks:
-        fwhm_bounds_list = fwhm_bounds
-    else:
-        print(
-            f"Error: fwhm_bounds must be a single (min, max) tuple or a list of {n_peaks} tuples."
-        )
-        return None
-
-    # Get the pre-compiled model
-    multi_peak_model = _generate_peak_model(n_peaks, shape, x_center)
-    w_factor = 2 * np.sqrt(2 * np.log(2)) if shape.lower() == "gaussian" else 2.0
-
-    y_min, y_max = np.min(y), np.max(y)
-    y_range = y_max - y_min
-
-    amp_guess = y_range
-    baseline_guess = np.percentile(y, 5)
-    slope_guess = (y[-1] - y[0]) / (x[-1] - x[0]) if len(x) > 1 else 0.0
-
-    p0, bounds_lower, bounds_upper = [], [], []
-
-    for i, c in enumerate(peak_centers):
-        peak_fwhm_min, peak_fwhm_max = fwhm_bounds_list[i]
-        w_min, w_max = peak_fwhm_min / w_factor, peak_fwhm_max / w_factor
-        width_guess = np.clip(
-            (w_sorted[1] - w_sorted[0]) / (n_peaks * 5) / w_factor, w_min, w_max
-        )
-
-        p0.extend([amp_guess, c, width_guess])
-        bounds_lower.extend([0, max(w_sorted[0], c - center_tolerance), w_min])
-        bounds_upper.extend([np.inf, min(w_sorted[1], c + center_tolerance), w_max])
-
-    p0.extend([slope_guess, baseline_guess])
-    bounds_lower.extend([-np.abs(slope_guess) * 10 - 0.1, y_min - y_range * 0.5])
-    bounds_upper.extend(
-        [
-            np.abs(slope_guess) * 10 + 0.1,
-            max(y_min + (y_range * 0.15), baseline_guess + 1e-5),
-        ]
-    )
-
-    try:
-        popt, pcov = curve_fit(
-            multi_peak_model, x, y, p0=p0, bounds=(bounds_lower, bounds_upper)
-        )
-    except RuntimeError:
-        print(f"Fit failed to converge for point {point_index}.")
-        return None
-
-    if plot or ax is not None:
-        if ax is None:
-            fig, ax = plt.subplots(figsize=(8, 5))
-
-        ax.plot(x, y, "k.", alpha=0.6, label="Raw Data")
-        x_smooth = np.linspace(w_sorted[0], w_sorted[1], 500)
-        ax.plot(
-            x_smooth,
-            multi_peak_model(x_smooth, *popt),
-            "r-",
-            linewidth=2,
-            label="Total Fit",
-        )
-
-        baseline_fit = popt[-2] * (x_smooth - x_center) + popt[-1]
-        ax.plot(x_smooth, baseline_fit, ":", color="grey", alpha=0.8, label="Baseline")
-
-        for i in range(n_peaks):
-            a, c, w = popt[i * 3 : i * 3 + 3]
-            actual_fwhm = w * w_factor
-
-            if shape.lower() == "gaussian":
-                single_y = (
-                    a * np.exp(-((x_smooth - c) ** 2) / (2 * w**2)) + baseline_fit
-                )
-            else:
-                single_y = a * (w**2 / ((x_smooth - c) ** 2 + w**2)) + baseline_fit
-
-            ax.plot(
-                x_smooth,
-                single_y,
-                "--",
-                label=f"Peak {i+1}: {c:.1f} (w={actual_fwhm:.1f})",
+    A list of any other length, or a value <= 0, raises: a zero tolerance makes
+    the lower and upper centre bounds equal, which curve_fit rejects.
+    """
+    if np.ndim(center_tolerance) > 0:
+        tol = [float(t) for t in np.ravel(center_tolerance)]
+        if len(tol) == 1:
+            tol = tol * n_peaks
+        elif len(tol) != n_peaks:
+            raise ValueError(
+                f"center_tolerance has {len(tol)} values but there are {n_peaks} "
+                "peak_centers. Give one value for all peaks, or one per peak."
             )
-
-        ax.set_title(f"Point {point_index}")
-
-    return popt
+    else:
+        tol = [float(center_tolerance)] * n_peaks
+    bad = [f"peak {j+1}: {t:g}" for j, t in enumerate(tol) if not t > 0]
+    if bad:
+        raise ValueError("center_tolerance must be > 0 (" + ", ".join(bad) + ").")
+    return tol
 
 
 def fit_all_spectra(
@@ -1688,11 +2221,8 @@ def fit_all_spectra(
     if n_peaks == 0:
         raise ValueError("peak_centers is empty - nothing to fit.")
 
-    if center_tolerance == 0:
-        raise ValueError(
-            "center_tolerance must be > 0 "
-        )
-        
+    tols = per_peak_tolerance(center_tolerance, n_peaks)
+
     if len(fwhm_bounds_list) != n_peaks:
         raise ValueError(
             f"fwhm_bounds has {len(fwhm_bounds_list)} entries but there are "
@@ -1708,11 +2238,11 @@ def fit_all_spectra(
     # Centre bounds and centre guesses do not depend on the pixel - build once.
     center_bounds, center_p0, problems = [], [], []
     for j, c in enumerate(peak_centers):
-        lo = max(w_sorted[0], c - center_tolerance)
-        hi = min(w_sorted[1], c + center_tolerance)
+        lo = max(w_sorted[0], c - tols[j])
+        hi = min(w_sorted[1], c + tols[j])
         if lo >= hi:
             problems.append(
-                f"  peak {j+1}: centre {c} +/- {center_tolerance} does not overlap "
+                f"  peak {j+1}: centre {c} +/- {tols[j]:g} does not overlap "
                 f"the fit window [{w_sorted[0]:.1f}, {w_sorted[1]:.1f}]"
             )
             lo, hi = w_sorted[0], w_sorted[1]   # placeholder; we raise below anyway
@@ -1749,6 +2279,7 @@ def fit_all_spectra(
 
     for i in range(num_points):
         y_raw = y_matrix[i]
+        r_squared = np.nan  # stays NaN unless the fit succeeds
 
         # --- Mask out any isolated NaNs/Infs in this specific row ---
         valid_mask = np.isfinite(y_raw)
@@ -1816,6 +2347,13 @@ def fit_all_spectra(
                     bounds=(bounds_lower, bounds_upper),
                 )
                 last_popt = popt
+
+                # --- R-squared on the points that were fitted ---
+                # (same definition as the PDM fit in Fitting_module)
+                y_pred = multi_peak_model(x_fit, *popt)
+                ss_res = np.sum((y_fit - y_pred) ** 2)
+                ss_tot = np.sum((y_fit - np.mean(y_fit)) ** 2)
+                r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
             except Exception as exc:
                 popt = None
                 last_popt = None  # Reset if failed
@@ -1854,10 +2392,16 @@ def fit_all_spectra(
                             a * (w**2 / ((x_smooth - c) ** 2 + w**2)) + baseline_fit
                         )
                     current_ax.plot(x_smooth, single_y, "--")
-            current_ax.set_title(f"Point {i}")
+                current_ax.set_title(f"Point {i}  (R$^2$={r_squared:.3f})")
+            else:
+                current_ax.set_title(f"Point {i}")
 
         # 3. Parameter extraction
-        row_data = {"point": i}
+        row_data = {
+            "point": i,
+            "fit_success": popt is not None,
+            "r_squared": r_squared,
+        }
         if popt is not None:
             row_data["baseline"] = popt[-1]
             for j in range(n_peaks):
@@ -1898,7 +2442,7 @@ def fit_all_spectra(
         plt.show()
 
     print("\nFitting complete!")
-    
+
     if fit_failures:
         counts = Counter(kind for _, kind, _ in fit_failures)
         print_warning(f"{len(fit_failures)}/{num_points} spectra failed to fit:")
@@ -1906,8 +2450,207 @@ def fit_all_spectra(
             print_warning(f"    {n} x {kind}")
         first_i, first_kind, first_msg = fit_failures[0]
         print_warning(f"    first: point {first_i} - {first_kind}: {first_msg}")
-    
+
     return pd.DataFrame(results)
+
+
+def _recorded_samples(intfgm, trim=INTFGM_TRIM):
+    """
+    Yields each interferogram's usable samples (in volts): the ones
+    make_single_spec keeps. Unrecorded samples (stage position 0) and
+    non-finite values are dropped, and `trim` samples at each end are ignored,
+    since those can be damaged.
+    """
+    vals = np.atleast_2d(np.asarray(intfgm.values, dtype=float))
+    try:
+        pos = np.atleast_2d(np.asarray(intfgm.stage_position_mm.values, dtype=float))
+    except AttributeError:
+        pos = np.ones_like(vals)
+    for p, v in zip(pos, vals):
+        v = v[(p != 0) & np.isfinite(v)]
+        if trim and v.size > 2 * trim:
+            v = v[trim:-trim]
+        yield v
+
+
+def interferogram_pp(intfgm, trim=INTFGM_TRIM):
+    """
+    Peak-to-peak amplitude of each interferogram, one value per point, in uV
+    (recorded volts x 1e6, the scaling plot_intfgm uses).
+
+    Samples as in _recorded_samples. Pass baseline-corrected interferograms,
+    so a slow drift of the offset during a sweep does not count as amplitude.
+    """
+    return np.array([(v.max() - v.min()) * 1e6 if v.size else np.nan
+                     for v in _recorded_samples(intfgm, trim)])
+
+
+def interferogram_offset(intfgm, trim=INTFGM_TRIM):
+    """
+    Mean level (DC offset) of each interferogram, one value per point, in uV.
+
+    The offset is the part of the demodulated signal that does not interfere
+    with the reference arm: tip-scattered light at this harmonic, summed over
+    the whole laser spectrum. It tracks the broadband (background) scattering
+    and laser power, independent of the fringes. Pass the RAW interferograms -
+    baseline correction removes it. Signed: it is the lock-in X quadrature, so
+    its sign depends on the demodulator phase. Samples as in _recorded_samples.
+    """
+    return np.array([v.mean() * 1e6 if v.size else np.nan
+                     for v in _recorded_samples(intfgm, trim)])
+
+
+def background_tilt(wavenumbers, spectra, regions):
+    """
+    Level and spectral tilt of each spectrum's background, measured on its
+    off-resonance points only: no fit model is involved, so the result is the
+    same whatever fit (if any) runs afterwards, and nothing trades off against
+    the peaks.
+
+    A straight line is fitted to ln|S| against wavenumber over the points that
+    fall inside `regions` (phase_fit_regions, which are chosen free of
+    absorption):  ln|S(w)| = ln(level) + slope * (w - w_c),  where w_c is the
+    middle of the span the regions cover.
+
+    wavenumbers : (W,) axis in cm^-1
+    spectra     : (N, W) or (W,) spectra, complex or real (e.g. S/R); one row per point
+    regions     : list of [lo, hi] pairs; empty or malformed entries are ignored
+
+    Returns (level, tilt), each of length N:
+      level : |S| at w_c - the background amplitude of the normalised spectrum
+      tilt  : relative change of |S| in % per 100 cm^-1, i.e. 1e4 * slope
+              (logarithmic, so +10 means |S| grows by a factor e^0.1 per
+              100 cm^-1). It follows the spectral SHAPE of the background, for
+              example the laser spectrum drifting away from the one the
+              reference was recorded with, a changing non-resonant response or
+              far-field background. Interferogram p-p and offset cannot show
+              this.
+    A spectrum with fewer than 3 usable points in the regions gives NaN.
+    Absorption inside the regions (band wings included) leaks into both values.
+    """
+    w = np.asarray(wavenumbers, dtype=float)
+    S = np.atleast_2d(np.asarray(spectra))
+    n = S.shape[0]
+    level = np.full(n, np.nan)
+    tilt = np.full(n, np.nan)
+
+    in_regions = np.zeros(w.size, dtype=bool)
+    edges = []
+    for r in regions or []:
+        if r is None or len(r) != 2:
+            continue
+        lo, hi = sorted(float(v) for v in r)
+        in_regions |= (w >= lo) & (w <= hi)
+        edges += [lo, hi]
+    if not edges or not in_regions.any():
+        return level, tilt
+
+    x = w[in_regions] - 0.5 * (min(edges) + max(edges))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        y = np.log(np.abs(S[:, in_regions]))
+    for i in range(n):
+        ok = np.isfinite(y[i])
+        if ok.sum() < 3 or np.ptp(x[ok]) == 0:
+            continue
+        slope, intercept = np.polyfit(x[ok], y[i, ok], 1)
+        level[i] = np.exp(intercept)
+        tilt[i] = 1e4 * slope
+    return level, tilt
+
+
+def _point_series_panel(ax, values, keep, row_length, color, trend_color):
+    """One per-point series with row boundaries, hollow R^2 failures and a
+    running median. Returns the running median."""
+    n = len(values)
+    x = np.arange(n)
+    if row_length and row_length < n:
+        for b in range(row_length, n, row_length):
+            ax.axvline(b - 0.5, color="0.88", lw=0.8, zorder=0)
+    ax.plot(x, values, color=color, lw=0.8, alpha=0.5, zorder=2)
+    ax.scatter(x[keep], values[keep], s=14, color=color, zorder=3, label="point")
+    if (~keep).any():
+        ax.scatter(x[~keep], values[~keep], s=14, facecolors="none", edgecolors=color,
+                   zorder=3, label="point (fails R² filter)")
+    window = int(row_length) if row_length else max(3, n // 10)
+    trend = pd.Series(values).rolling(window, center=True, min_periods=1).median().to_numpy()
+    ax.plot(x, trend, color=trend_color, lw=2, zorder=4, label=f"running median ({window} points)")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8, loc="best")
+    return trend
+
+
+def plot_intfgm_pp(pp, title, ref_pp=None, row_length=None, keep=None,
+                   offset=None, ref_offset=None, tilt=None, tilt_label=None):
+    """
+    Drift monitors against point number: interferogram peak-to-peak amplitude
+    and, when given, interferogram offset and background tilt, one panel each.
+
+    pp         : per-point amplitudes from interferogram_pp (uV)
+    ref_pp     : the Au reference interferogram(s); their mean is given in the title
+    row_length : points per scan row; draws faint row boundaries and sets the
+                 running-median window. Sample contrast changes from point to
+                 point; a drift shows up as a trend in the running median.
+    keep       : boolean mask of points that pass the R^2 filter; the others
+                 are drawn hollow.
+    offset     : per-point interferogram offsets from interferogram_offset (uV)
+    ref_offset : the Au reference interferogram offset(s), given in that panel's title
+    tilt       : per-point background tilt from background_tilt (% per 100 cm^-1)
+    tilt_label : y label of the tilt panel (names the normalised quantity)
+    """
+    from matplotlib.ticker import MaxNLocator
+
+    pp = np.asarray(pp, dtype=float)
+    n = len(pp)
+    keep = np.ones(n, dtype=bool) if keep is None else np.asarray(keep, dtype=bool)
+    blue, orange, green, violet = "#2a78d6", "#eb6834", "#1f9e76", "#6250d6"
+    with_offset = offset is not None and len(offset) == n
+    with_tilt = tilt is not None and len(tilt) == n and np.isfinite(np.asarray(tilt, float)).any()
+
+    n_panels = 1 + with_offset + with_tilt
+    fig, axes = plt.subplots(n_panels, 1, figsize=(8, 0.6 + 3.0 * n_panels), sharex=True, squeeze=False)
+    axes = list(axes[:, 0])
+
+    def _with_ref(text, ref):
+        # stated, not drawn: the reference is usually several times larger and
+        # a line at its level would flatten the drift this plot is for
+        if ref is not None and np.isfinite(ref).any():
+            return f"{text}   (Au reference {float(np.nanmean(ref)):.0f} µV)"
+        return text
+
+    def _zero_line(ax, values):
+        if np.nanmin(values) < 0 < np.nanmax(values):   # only when it crosses zero,
+            ax.axhline(0, color="0.6", lw=0.8, zorder=1)   # else it squashes the trend
+
+    ax = axes.pop(0)
+    _point_series_panel(ax, pp, keep, row_length, blue, orange)
+    ax.set_ylabel("interferogram p-p (µV)")
+    ax.set_title(_with_ref(f"{title}: interferogram peak-to-peak", ref_pp),
+                 fontsize=10, loc="left")
+    last = ax
+
+    if with_offset:
+        ax = axes.pop(0)
+        offset = np.asarray(offset, dtype=float)
+        _point_series_panel(ax, offset, keep, row_length, green, orange)
+        _zero_line(ax, offset)
+        ax.set_ylabel("interferogram offset (µV)")
+        ax.set_title(_with_ref("interferogram offset", ref_offset), fontsize=10, loc="left")
+        last = ax
+
+    if with_tilt:
+        ax = axes.pop(0)
+        tilt = np.asarray(tilt, dtype=float)
+        _point_series_panel(ax, tilt, keep, row_length, violet, orange)
+        _zero_line(ax, tilt)
+        ax.set_ylabel(tilt_label or "background tilt (% / 100 cm⁻¹)")
+        ax.set_title("background tilt over phase_fit_regions",
+                     fontsize=10, loc="left")
+        last = ax
+
+    last.set_xlabel("point number")
+    last.xaxis.set_major_locator(MaxNLocator(integer=True))
+    fig.tight_layout()
+    return fig
 
 
 def plot_correlations(df, pairs, fitting_type):
@@ -1995,148 +2738,8 @@ def plot_correlations(df, pairs, fitting_type):
 
 
 # ==========================================
-# AFM drift correction
-# ==========================================
-
-
-def extract_all_afm_images(data_dict):
-    """
-    Extracts all AFM and optical images from a parsed AXZ dictionary.
-
-    Returns:
-    - A dictionary mapping channel names (e.g., 'Height 1', 'Height 1_Retrace')
-      to their corresponding 2D NumPy arrays.
-    """
-    extracted_images = {}
-
-    # Navigate safely to the HeightMaps list
-    afm_scans = data_dict.get("Document", {}).get("HeightMaps", {}).get("HeightMap", [])
-
-    # If there is only one image, the parser might return a dict instead of a list
-    if isinstance(afm_scans, dict):
-        afm_scans = [afm_scans]
-
-    for scan in afm_scans:
-        # 1. Dig out the Label/Channel Name
-        label = scan.get("Label", "")
-        if not label:
-            tags = scan.get("Tags", {}).get("Tag", [])
-            if isinstance(tags, dict):
-                tags = [tags]
-            for tag in tags:
-                attrs = tag.get("Attributes", {})
-                if attrs.get("Name") in ["Channel", "DataType", "Label"]:
-                    label = attrs.get("Value", label)
-
-        if not label:
-            label = f"Unknown_Channel_{len(extracted_images)}"
-
-        # 2. Handle Trace vs. Retrace (Preventing dictionary overwrites)
-        original_label = label
-        counter = 1
-        while label in extracted_images:
-            if counter == 1:
-                label = f"{original_label}_Retrace"
-            else:
-                label = f"{original_label}_Retrace_{counter}"
-            counter += 1
-
-        # 3. Decode the Base64 data into a NumPy matrix
-        base64_string = scan.get("SampleBase64", {}).get("Text", "")
-        if base64_string:
-            decoded = base64.b64decode(base64_string)
-
-            # Extract resolution (default to 100x100 if tags are missing)
-            res_x = int(scan.get("Resolution", {}).get("X", {}).get("Text", 100))
-            res_y = int(scan.get("Resolution", {}).get("Y", {}).get("Text", 100))
-
-            try:
-                # Convert binary to 32-bit float array and reshape to 2D
-                img_matrix = np.frombuffer(decoded, dtype=np.float32).reshape(
-                    res_y, res_x
-                )
-                extracted_images[label] = img_matrix
-            except ValueError:
-                print(
-                    f"Warning: Could not reshape '{original_label}' into {res_y}x{res_x}"
-                )
-
-    return extracted_images
-
-
-# ==========================================
 # Misc functions
 # ==========================================
-
-
-def load_folder_to_xarray(
-    folder_path,
-    pattern="*.csv",
-    x_col=0,
-    y_col=1,
-    x_name="wavelength_or_freq",
-    y_name="intensity",
-    delimiter=",",
-    **kwargs,
-):
-    """
-    Reads multiple files from a folder and compiles them into a 2D xarray.DataArray.
-
-    Parameters:
-    - folder_path (str/Path): Directory containing the files.
-    - pattern (str): File matching criterion (e.g., "*.csv", "*.txt").
-    - x_col (int or str): Index or name of the column to use as the X-axis (default: 0).
-    - y_col (int or str): Index or name of the column to use as the Y-axis (default: 1).
-    - x_name (str): The name to assign to the X-axis in the final xarray.
-    - y_name (str): The name of the data values in the final xarray.
-    - delimiter (str): Delimiter used in the files (default: ",").
-    - **kwargs: Any extra arguments are passed directly to pandas.read_csv
-                (e.g., skiprows=10, header=None, sep='\t').
-
-    Returns:
-    - xr.DataArray: A 2D array with dimensions (x_name, sample).
-    """
-    folder = Path(folder_path)
-    files = list(folder.glob(pattern))
-
-    if not files:
-        raise FileNotFoundError(f"No files found matching '{pattern}' in {folder_path}")
-
-    data_dict = {}
-
-    for file in files:
-        try:
-            # Read only the two specific columns we need using pandas
-            df = pd.read_csv(file, sep=delimiter, usecols=[x_col, y_col], **kwargs)
-
-            # Identify which column is X and which is Y based on their positions
-            x_col_name = df.columns[0]
-            y_col_name = df.columns[1]
-
-            # Set X as the index, and extract Y as a Series
-            series = df.set_index(x_col_name)[y_col_name]
-
-            # Name the series after the file name (without the extension)
-            series.name = file.stem
-
-            data_dict[file.stem] = series
-
-        except Exception as e:
-            print_warning(f"Warning: Could not process '{file.name}'. Error: {e}")
-
-    # Concat aligns all files by their X-axis index automatically.
-    # If one file has 400.1nm and another lacks it, Pandas fills it with NaN.
-    combined_df = pd.concat(data_dict.values(), axis=1)
-
-    # Clean up the axis names for xarray
-    combined_df.index.name = x_name
-    combined_df.columns.name = "sample"
-
-    # Convert to xarray DataArray
-    da = xr.DataArray(combined_df)
-    da.name = y_name
-
-    return da
 
 
 def extract_raw_spectra_coords(axz_dict):
@@ -2169,10 +2772,12 @@ def extract_raw_spectra_coords(axz_dict):
         loc = spec.get("Location", {})
         x_val = loc.get("X")
         y_val = loc.get("Y")
-        
+
         if x_val is None or y_val is None:
-            continue # Skip invalid points
-            
+            # keep the row so point i still lines up with fit-result row i
+            absolute_coords.append([np.nan, np.nan])
+            continue
+
         if isinstance(x_val, dict):
             # Handles XMLattributes parsed as dictionaries (e.g., {'#text': 'value'})
             abs_x = float(x_val.get("#text", list(x_val.values())[0]))
@@ -2238,7 +2843,7 @@ def save_afm_images(data_dict, output_folder, file_format="csv"):
                         "p": 1e-12, # pico
                         "": 1.0     # no prefix
                     }
-                    
+
                     # Convert the raw matrix values to the base unit (e.g., nm -> m)
                     z_multiplier = prefix_multipliers.get(prefix.lower(), 1.0)
                     base_img_matrix = img_matrix.astype(np.float64) * z_multiplier
@@ -2328,7 +2933,9 @@ def save_video_pictures(data_dict, output_folder):
 
 
 def save_all_interferograms(data_dict, output_folder):
-    """Saves spectral data, mapping Y-axis units from DataSources and X-axis from SweepUnits."""
+    """Saves spectral data, mapping Y-axis units from DataSources. The sweep
+    position is written in mm, converted exactly as extract_axz_interferogram
+    reads it (the .axz stores metres)."""
     output_dir = Path(output_folder)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2374,19 +2981,23 @@ def save_all_interferograms(data_dict, output_folder):
             if clean_name not in grouped_signals:
                 grouped_signals[clean_name] = []
 
-                # Assign units
-                z_unit = ig.get("SweepUnits", {}).get("Text", "mm")
-                z_unit_reference[clean_name] = z_unit
+                # Units. SweepStart/SweepEnd are stored in METRES even though
+                # the file's SweepUnits says "mm" (e.g. 0.0002-0.0015 for a
+                # 0.2-1.5 mm sweep). extract_axz_interferogram reads them as
+                # metres, so convert the same way and label the column mm.
+                # (Before 2026-11-17 the raw metre values were written under the
+                # file's "mm" label.)
+                z_unit_reference[clean_name] = "mm"
                 y_unit_reference[clean_name] = y_units_map.get(sig_name, "a.u.")
 
-                # Construct Z-axis
+                # Construct Z-axis in mm (metres x 1e3)
                 sweep_start = float(ig.get("SweepStart", {}).get("Text", 0))
                 sweep_end = float(ig.get("SweepEnd", {}).get("Text", 1))
                 points = int(ig.get("Points", {}).get("Text", len(data_array)))
 
                 z_axis_reference[clean_name] = np.linspace(
                     sweep_start, sweep_end, points
-                )
+                ) * 1e3
 
             grouped_signals[clean_name].append(data_array)
 

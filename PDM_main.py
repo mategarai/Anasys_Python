@@ -31,13 +31,29 @@ import numpy as np
 import numpy.fft as fft
 from scipy.interpolate import interp1d
 from numpy.polynomial.laguerre import laggauss
+from scipy.special import wofz
 
 # =============================================================================
-# Tip / tapping parameters (unchanged)
+# Tip / tapping / illumination parameters
 # =============================================================================
-Tip_rad  = 20        # nm
-Tip_amp  = 50 / 2    # nm
-Tip_freq = 250e3     # Hz
+# Changed 2026-11-17 (previous values in brackets):
+#   TIP_RADIUS_NM  30 nm                                         [20 nm]
+#   TIP_AMP_NM     50 nm tapping amplitude, zero-to-peak, so the
+#                  tip moves 0-100 nm above contact              [25 nm, 0-50 nm]
+#   TIP_MATERIAL   "gold"; "platinum" keeps the old Pt tip       [platinum]
+#   THETA_DEG      60 deg, angle of incidence measured from the
+#                  surface NORMAL (the convention of the Fresnel
+#                  formulas below)                               [30 deg]
+# All of these change the absolute near-field contrast and therefore the fitted
+# oscillator strength A. Record them with any PDM result.
+TIP_RADIUS_NM = 30.0
+TIP_AMP_NM = 50.0
+TIP_MATERIAL = "gold"        # "gold" or "platinum"
+THETA_DEG = 60.0
+
+Tip_rad  = TIP_RADIUS_NM     # nm (old names, used below)
+Tip_amp  = TIP_AMP_NM        # nm, zero-to-peak
+Tip_freq = 250e3     # Hz (sets the time base only; the result does not depend on it)
 SAMPLES_PER_CYCLE = 32
 
 Time = np.arange(SAMPLES_PER_CYCLE) / (SAMPLES_PER_CYCLE * Tip_freq)
@@ -106,18 +122,18 @@ def PlatinumE(ROIcm):
     ROIcm = np.asarray(ROIcm, dtype=float)
     return _pt_f1(ROIcm), _pt_f2(ROIcm)
 
-# =============================================================================
-# Utilities
-# =============================================================================
-def cart2pol(x, y):
-    rho = np.sqrt(x**2 + y**2)
-    phi = np.arctan2(y, x)
-    return rho, phi
 
-def pol2cart(rho, phi):
-    x = rho * np.cos(phi)
-    y = rho * np.sin(phi)
-    return x, y
+_TIP_MATERIALS = {"gold": GoldE, "platinum": PlatinumE}
+
+
+def tip_permittivity(ROIcm, material=None):
+    """Complex permittivity of the tip material (TIP_MATERIAL unless given)."""
+    material = (material or TIP_MATERIAL).lower()
+    if material not in _TIP_MATERIALS:
+        raise ValueError(f"TIP_MATERIAL {material!r}: use one of {sorted(_TIP_MATERIALS)}")
+    e1, e2 = _TIP_MATERIALS[material](ROIcm)
+    return e1 + 1j * e2
+
 
 # =========================
 # PDM_main.py (drop-in add-on)
@@ -133,7 +149,7 @@ def _kz_in_medium(eps_j, eps0, sin_theta, k0):
     """
     return k0 * np.sqrt(eps_j - eps0 * (sin_theta**2))
 
-def fresnel_rp_halfspace(eps2, theta_deg=30.0, eps0=1.0):
+def fresnel_rp_halfspace(eps2, theta_deg=THETA_DEG, eps0=1.0):
     """
     Complex p-polarized Fresnel field reflection coefficient r_p for:
       medium 0 (eps0) -> medium 2 (eps2)
@@ -153,7 +169,7 @@ def fresnel_rp_halfspace(eps2, theta_deg=30.0, eps0=1.0):
     rp = (eps2 * kz0 - eps0_c * kz2) / (eps2 * kz0 + eps0_c * kz2)
     return rp
 
-def fresnel_rp_layered_fast(eps_film, d_nm, eps2, kz0, kz2, k0, theta_deg=30.0, eps0=1.0):
+def fresnel_rp_layered_fast(eps_film, d_nm, eps2, kz0, kz2, k0, theta_deg=THETA_DEG, eps0=1.0):
     """
     Optimized complex p-polarized r_p for 3-layer stack.
     kz0 (air) and kz2 (gold) are precalculated.
@@ -224,52 +240,21 @@ def beta_layered_qs(eps_film, eps_sub, d_nm, eps0=1.0):
     return np.einsum('ijk,k->ij', num, _wq2)
 
 
-def fresnel_rp_layered(eps_film, d_nm, eps_sub, x_cm, theta_deg=30.0, eps0=1.0):
-    """
-    Complex p-polarized r_p for 3-layer stack:
-        medium 0: air (eps0)
-        medium 1: film (eps_film), thickness d_nm
-        medium 2: substrate (eps_sub) (gold)
-
-    Uses standard thin-film formula:
-      r012 = (r01 + r12*exp(2 i kz1 d)) / (1 + r01*r12*exp(2 i kz1 d))
-
-    IMPORTANT:
-      Here kz1 depends on wavelength, so we DO need k0 = 2*pi/lambda.
-      x_cm is wavenumber in cm^-1, so lambda_cm = 1/x_cm, and k0 (in cm^-1) = 2*pi*x_cm.
-      Convert d_nm -> d_cm using 1 nm = 1e-7 cm.
-    """
-    theta = np.deg2rad(theta_deg)
-    sin_t = np.sin(theta)
-
-    eps0_c = np.complex128(eps0)
-    eps1 = np.asarray(eps_film, dtype=np.complex128)
-    eps2 = np.asarray(eps_sub,  dtype=np.complex128)
-    x_cm = np.asarray(x_cm, dtype=float)
-
-    d_cm = float(d_nm) * 1e-7
-    k0 = 2.0 * np.pi * x_cm  # since lambda_cm = 1/x_cm
-
-    kz0 = _kz_in_medium(eps0_c, eps0_c, sin_t, k0)
-    kz1 = _kz_in_medium(eps1,   eps0_c, sin_t, k0)
-    kz2 = _kz_in_medium(eps2,   eps0_c, sin_t, k0)
-
-    # p-polarized interface reflection coefficients (field)
-    r01 = (eps1 * kz0 - eps0_c * kz1) / (eps1 * kz0 + eps0_c * kz1)
-    r12 = (eps2 * kz1 - eps1   * kz2) / (eps2 * kz1 + eps1   * kz2)
-
-    phase = np.exp(2j * kz1 * d_cm)
-    r012 = (r01 + r12 * phase) / (1.0 + r01 * r12 * phase)
-    return r012
-
 # =============================================================================
 # Vectorized lock-in (2H)
 # =============================================================================
 
-# Precompute globally using your existing FFT_freq and Time arrays
-phase_2H = np.exp(-2j * np.pi * FFT_freq[idx_2H] * Time)
+# Time spans exactly one tapping cycle, so harmonic n is simply FFT bin n.
+_lockin_kernels = {}
+def _lockin_kernel(harmonic):
+    k = _lockin_kernels.get(harmonic)
+    if k is None:
+        if not 1 <= harmonic < SAMPLES_PER_CYCLE // 2:
+            raise ValueError(f"harmonic must be 1..{SAMPLES_PER_CYCLE // 2 - 1}")
+        k = _lockin_kernels[harmonic] = np.exp(-2j * np.pi * harmonic * Tip_freq * Time)
+    return k
 
-def LockIn_complex(Beta, rp, alpha_0, E_inc=1.0):
+def LockIn_complex(Beta, rp, alpha_0, E_inc=1.0, harmonic=2):
     """Beta may be (Nx,) for a half-space or (Nx, Nh) when it varies over the
     tapping cycle, as it does for a layered sample."""
     pref = (alpha_0 * (1.0 + rp)**2 * E_inc)[:, None]
@@ -279,62 +264,8 @@ def LockIn_complex(Beta, rp, alpha_0, E_inc=1.0):
     else:
         aB = alpha_0[:, None] * Beta          # (Nx, Nh)
     denom = 1.0 - aB * inv_h3_scaled[None, :]
-    return np.dot(pref / denom, phase_2H)
+    return np.dot(pref / denom, _lockin_kernel(harmonic))
 
-# =============================================================================
-# Physically correct complex oscillators for ε(ω)
-# =============================================================================
-
-def eps_lorentz_osc(x, S, w0, gamma):
-    """
-    Complex Lorentz oscillator contribution in wavenumber units.
-
-    ε(ω) += S / (w0^2 - w^2 - i*gamma*w)
-
-    Parameters
-    ----------
-    x : array (cm^-1)
-    S : oscillator strength (sets amplitude; units depend on convention)
-    w0 : center (cm^-1)
-    gamma : damping (cm^-1)   (often ~ FWHM-ish; this form uses gamma*w)
-    """
-    x = np.asarray(x, dtype=float)
-    return S / (w0**2 - x**2 - 1j * gamma * x)
-
-def eps_voigt_inhom(x, S, w0, gamma, sigma, N_INH=11, span=4.0):
-    """
-    Inhomogeneous (Gaussian) broadening of the Lorentz oscillator by distributing w0.
-
-    Approximate:
-      ∫ dω0'  G(ω0'; w0, sigma) * S/(ω0'^2 - ω^2 - iγ ω)
-
-    We use a fixed grid ω0' = w0 + u*sigma, u in [-span, span]
-    with Gaussian weights, normalized.
-
-    Parameters
-    ----------
-    sigma : std dev of center distribution (cm^-1)
-    N_INH : number of quadrature points (odd is nice)
-    span  : +/- span*sigma integration window (typically 3-5)
-    """
-    x = np.asarray(x, dtype=float)
-    sigma = float(sigma)
-    if sigma <= 0:
-        return eps_lorentz_osc(x, S, w0, gamma)
-
-    # quadrature points in units of sigma
-    u = np.linspace(-span, span, int(N_INH))
-    w0p = w0 + u * sigma  # (N_INH,)
-
-    # Gaussian weights, normalized
-    w = np.exp(-0.5 * u**2)
-    w /= np.sum(w)
-
-    # Vectorize: compute oscillator for each w0p and weight-sum
-    # shape (N_INH, Nx)
-    denom = (w0p[:, None] ** 2) - (x[None, :] ** 2) - 1j * gamma * x[None, :]
-    contrib = (S * w[:, None]) / denom
-    return np.sum(contrib, axis=0)
 
 # =============================================================================
 # Build ε(ω) from oscillators
@@ -360,11 +291,16 @@ def build_eps_sample(x, eps_inf, num_osc, osc_args, profile, N_INH=21, span=4.0)
         eps += np.sum(S / (w0**2 - x**2 - 1j * gam * x), axis=0)
         
     elif profile == "voigt":
-        S, w0, gam, sig = P[:, 0, None, None], P[:, 1, None, None], P[:, 2, None, None], P[:, 3, None, None]
-        u, w = _get_voigt_uw(N_INH, span)
-        w0p = w0 + u * sig
-        denom = w0p**2 - x**2 - 1j * gam * x
-        eps += np.sum((S * w) / denom, axis=(0, 1))
+        # Exact Gaussian(w0) convolution of S/(w0^2 - w^2 - i*gam*w)
+        # (Brendel-Bormann). Replaces the 21-point quadrature, which turns
+        # into a comb when gam is smaller than its 0.4*sigma point spacing.
+        S, w0, gam = P[:, 0, None], P[:, 1, None], P[:, 2, None]
+        sig = np.maximum(P[:, 3, None], 1e-3)
+        a = np.sqrt(x**2 + 1j * gam * x)               # Im(a) > 0 for x, gam > 0
+        z1 = (a - w0) / (np.sqrt(2.0) * sig)
+        z2 = (a + w0) / (np.sqrt(2.0) * sig)
+        eps += np.sum(1j * np.sqrt(np.pi) * S / (2.0 * np.sqrt(2.0) * a * sig)
+                      * (wofz(z1) + wofz(z2)), axis=0)
         
     else:
         raise ValueError(f"Unknown profile={profile!r}. Use 'lorentzian' or 'voigt'.")
@@ -379,12 +315,17 @@ def build_eps_sample(x, eps_inf, num_osc, osc_args, profile, N_INH=21, span=4.0)
 _pdm_cache = {'x_arr': np.array([])}
 
 def PDM(x, numOsc, eps_inf, *osc_args, profile="lorentzian",
-        d_film_nm , theta_deg=30.0, N_INH=21, span=4.0, bulk_sample=False):
+        d_film_nm , theta_deg=THETA_DEG, N_INH=21, span=4.0, bulk_sample=False, harmonic=2):
 
     x = np.asarray(x, dtype=float)
 
     # Check if x is the same as the previous call to avoid recalculating statics
-    if len(x) != len(_pdm_cache.get('x_arr', [])) or x[0] != _pdm_cache['x_arr'][0] or x[-1] != _pdm_cache['x_arr'][-1]:
+    if (len(x) != len(_pdm_cache.get('x_arr', [])) or x[0] != _pdm_cache['x_arr'][0]
+          or x[-1] != _pdm_cache['x_arr'][-1] or _pdm_cache.get('harmonic') != harmonic
+          or _pdm_cache.get('theta_deg') != theta_deg):
+        
+        _pdm_cache['harmonic'] = harmonic
+        _pdm_cache['theta_deg'] = theta_deg
         _pdm_cache['x_arr'] = x
         
         # Calculate and cache static reference data for this x-axis
@@ -393,11 +334,10 @@ def PDM(x, numOsc, eps_inf, *osc_args, profile="lorentzian",
         Beta_ref = (_pdm_cache['E_gold'] - 1.0) / (_pdm_cache['E_gold'] + 1.0)
         rp_ref = fresnel_rp_halfspace(_pdm_cache['E_gold'], theta_deg=theta_deg, eps0=1.0)
         
-        PtE1, PtE2 = PlatinumE(x)
-        E_tip = PtE1 + 1j * PtE2
+        E_tip = tip_permittivity(x)          # TIP_MATERIAL
         _pdm_cache['alpha_0'] = ((E_tip - 1.0) * 4.0 * np.pi * Tip_rad ** 3) / (E_tip + 2.0)
         
-        _pdm_cache['s2_ref'] = LockIn_complex(Beta_ref, rp_ref, _pdm_cache['alpha_0'], 1.0)
+        _pdm_cache['s2_ref'] = LockIn_complex(Beta_ref, rp_ref, _pdm_cache['alpha_0'], 1.0, harmonic)
 
         # --- NEW: Fresnel Cache ---
         eps0_c = np.complex128(1.0)
@@ -431,7 +371,7 @@ def PDM(x, numOsc, eps_inf, *osc_args, profile="lorentzian",
             E_samp, d_film_nm, E_gold, kz0, kz2, k0, theta_deg=theta_deg, eps0=1.0
         )
 
-    s2_samp = LockIn_complex(Beta_samp, rp_samp, alpha_0, 1.0)
+    s2_samp = LockIn_complex(Beta_samp, rp_samp, alpha_0, 1.0, harmonic)
     return s2_samp / s2_ref
 
 
@@ -439,12 +379,12 @@ def PDM(x, numOsc, eps_inf, *osc_args, profile="lorentzian",
 # Fitting wrapper
 # =============================================================================
 def PDM_fitting(x, *osc_args, eps_inf,
-                profile="lorentzian", d_film_nm, theta_deg=30.0, N_INH=21, span=4.0, bulk_sample=False):
+                profile="lorentzian", d_film_nm, theta_deg=THETA_DEG, N_INH=21, span=4.0, bulk_sample=False, harmonic=2):
     # infer numOsc from osc_args and profile
     pcount = _PROFILE_PARAM_COUNT[str(profile).lower()]
     numOsc = len(osc_args) // pcount
 
     z = PDM(x, numOsc, eps_inf, *osc_args,
-            profile=profile, d_film_nm=d_film_nm, theta_deg=theta_deg, N_INH=N_INH, span=span,bulk_sample=bulk_sample)
+            profile=profile, d_film_nm=d_film_nm, theta_deg=theta_deg, N_INH=N_INH, span=span,bulk_sample=bulk_sample,harmonic=harmonic)
 
     return z

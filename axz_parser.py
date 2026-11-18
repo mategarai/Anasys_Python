@@ -149,13 +149,5 @@ def load_axz_as_dict(
     return parse_xml_to_dict(xml_path)
 
 
-def decode_float64_base64(b64_text: str) -> Any:
-    """Decode base64 text to a NumPy float64 vector. (Kept for snom_utils compatibility)."""
-    import numpy as np
-
-    raw = base64.b64decode(b64_text)
-    return np.frombuffer(raw, dtype=np.float64)
-
-
 if __name__ == "__main__":
     pass
